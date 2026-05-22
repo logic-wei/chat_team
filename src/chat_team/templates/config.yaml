@@ -1,0 +1,33 @@
+# chat_team global configuration.
+#
+# This file is seeded into ~/.chat_team/config.yaml on first run.
+# Edit the user copy there — changes here only take effect for new installs.
+# All paths are relative to ~/.chat_team/ unless absolute.
+
+workspace_root: workspaces           # one subdirectory per chat session
+default_role: team_admin             # role that handles a brand-new session
+log_level: INFO                      # DEBUG / INFO / WARNING / ERROR
+
+session:
+  msgid_lru_size: 500                # WeCom callback dedup window
+  persistence_debounce_seconds: 10   # session.json flush debounce
+  per_turn_transfer_cap: 3           # max employee handoffs per user turn
+
+notebook:
+  max_bytes: 4096                    # soft cap for notebook.md (4KB)
+
+tools:
+  file_read_max_bytes: 1048576       # 1 MB
+  file_write_max_bytes: 1048576      # 1 MB
+  shell_timeout_seconds: 30
+  shell_output_max_bytes: 8192       # truncate echo back to LLM (full log on disk)
+
+llm:
+  provider: openai                   # only "openai" supported in v1
+  default_model: gpt-4o-mini
+  default_temperature: 0.3
+  default_history_token_budget: 12000  # per-role; tighter values trigger compaction sooner
+
+logging:
+  max_bytes: 10485760                # 10 MB per log file
+  backup_count: 5                    # keep 5 rotated files

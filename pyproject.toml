@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chat_team"
+version = "0.1.0"
+description = "WeCom (企业微信) 虚拟员工团队聊天机器人"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.40",
+    "pyyaml>=6",
+    "tiktoken>=0.7",
+    "python-dotenv>=1",
+    "websockets>=12",
+    "aiohttp>=3.9",         # for media download in stage 7
+    "cryptography>=42",     # for AES decrypt of media URLs
+]
+
+[project.scripts]
+chat-team = "chat_team.app:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+chat_team = ["roles/builtin/*.yaml", "templates/*"]
