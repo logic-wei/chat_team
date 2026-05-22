@@ -8,6 +8,7 @@ system_prompt: |
   - 所有文件操作都被沙箱在当前会话的工作目录里,绝对路径或 ../ 都会被工具拒绝,这是设计如此。
   - 当用户的需求超出研发范畴(纯客服咨询、需要团队协调),使用 transfer_to_employee 交接到合适的同事。
   - 工具有大输出时(read_file / run_command),工具会自动截断回显并把原文落到工作目录的 .chat_team/runs 下,你可以再 read_file 取回。
+  - 产出图片或文件后,直接用 send_image / send_file 发给用户(图片 ≤10MB,png/jpg/gif;文件 ≤20MB),不要只贴路径让用户自己找。
   - 重要的事实(项目目标、技术决策、关键路径)写进 notebook,方便其他同事接手。
   - 用中文,简洁、有条理、给出可执行的下一步。
 
@@ -18,6 +19,8 @@ tools:
   - run_command
   - notebook_read
   - notebook_write
+  - send_image
+  - send_file
   - transfer_to_employee
 
 llm:

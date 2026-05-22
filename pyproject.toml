@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 chat-team = "chat_team.app:run"
 chat-team-boss = "chat_team.boss:run"
+chat-team-tools = "chat_team.list_tools:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -102,7 +102,7 @@ class Agent:
             for call in assistant.tool_calls:
                 await stream.status(f"调用工具: {call.name}")
                 try:
-                    result = await self._invoke_tool(call)
+                    result = await self._invoke_tool(call, stream)
                 except TransferRequested as transfer:
                     # Close the dangling tool_call in our own history so this
                     # role's transcript stays well-formed if it's revisited.
@@ -128,11 +128,16 @@ class Agent:
         # safety fuse — too many loops without a final answer
         return "(已达到工具循环上限,本轮未给出最终答复)"
 
-    async def _invoke_tool(self, call: ToolCall) -> Any:
+    async def _invoke_tool(self, call: ToolCall, stream: StreamHandle) -> Any:
         if not self.tools.has(call.name):
             raise ToolError(f"unknown tool: {call.name}")
         tool: Tool = self.tools.get(call.name)
-        ctx = ToolContext(cwd=self.session.cwd, session=self.session, settings=self.settings)
+        ctx = ToolContext(
+            cwd=self.session.cwd,
+            session=self.session,
+            settings=self.settings,
+            stream=stream,
+        )
         return await tool.run(ctx, **(call.arguments or {}))
 
     # ---- model resolution --------------------------------------------------

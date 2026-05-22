@@ -5,6 +5,7 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 
@@ -44,6 +45,8 @@ class StreamHandle(Protocol):
     async def push(self, chunk: str, *, append: bool = True) -> None: ...
     async def status(self, note: str) -> None: ...
     async def finish(self, final_text: str) -> None: ...
+    async def send_image(self, path: Path, *, filename: str | None = None) -> None: ...
+    async def send_file(self, path: Path, *, filename: str | None = None) -> None: ...
 
 
 MessageHandler = Callable[[IncomingMessage, StreamHandle], Awaitable[None]]

@@ -111,6 +111,18 @@ chat-team-boss
 
 需要 `OPENAI_API_KEY`(同主机器人,从 `~/.chat_team/.env` 读)。
 
+## 看可用工具清单
+
+手写 role YAML 时,`tools:` 字段只能填主进程注册过的工具名。要看一份当前真实可用的清单:
+
+```bash
+chat-team-tools
+# 或不安装 console script: python -m chat_team.list_tools
+```
+
+会按工具名排序、附第一行简介。这个清单和 `chat-team-boss` 里的 `list_available_tools`
+工具同源 —— 加新工具后两边都自动可见,无需手动维护。
+
 ## 加一个角色
 
 不想手写?用 `chat-team-boss`(见上一节)让它替你写。手写示例:
@@ -168,8 +180,8 @@ python scripts/smoke_media_events.py              # AES-256-CBC + enter_chat / d
 - **单实例运行**。企微"新连接踢旧",同一 BotID 不能多副本启动,会互踢。
   后续考虑外部锁 / leader 选举。
 - **只支持 OpenAI Chat Completion**。Anthropic / Gemini 通过 `LLMProvider` 子类后续扩展。
-- **文件回传未实现**(`aibot_upload_media_init/chunk/finish`),目前研发员工产出文件只能
-  用 markdown 链接告知用户路径。
+- **媒体回传仅支持图片 / 文件**(`send_image` / `send_file` 工具,走
+  `aibot_upload_media_init/chunk/finish`);voice / video 暂不支持。
 
 ## 协议
 

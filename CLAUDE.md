@@ -25,6 +25,9 @@ python scripts/smoke_boss.py                      # CLI boss agent + team_tools
 
 # Conversational team-setup CLI (not the WeCom bot — see "Boss agent" below).
 chat-team-boss
+
+# Print all tools registered in the main runtime, for hand-authored role YAMLs.
+chat-team-tools          # or: python -m chat_team.list_tools
 ```
 
 There is no test framework — smokes are async `main()` scripts that print and assert. Add new smokes alongside the existing ones; they all set `CHAT_TEAM_HOME=/tmp/...` and `shutil.rmtree` it at startup so they don't pollute the real `~/.chat_team`.

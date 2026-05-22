@@ -15,8 +15,11 @@ slow user turn does not block the reader.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -44,6 +47,13 @@ WECOM_WS_URL = "wss://openws.work.weixin.qq.com"
 HEARTBEAT_INTERVAL = 30
 STREAM_PUSH_MIN_INTERVAL = 1.0          # seconds between intermediate stream frames
 WRITE_QUEUE_MAXSIZE = 1024
+
+UPLOAD_CHUNK_SIZE = 256 * 1024          # raw bytes per chunk; ~341KB base64, under 512KB cap
+UPLOAD_RESPONSE_TIMEOUT = 30.0          # per-step ack timeout
+MEDIA_SIZE_LIMITS = {
+    "image": 10 * 1024 * 1024,
+    "file": 20 * 1024 * 1024,
+}
 
 _MENTION_RE = re.compile(r"^@\S+\s+")
 
@@ -123,6 +133,23 @@ class WeComStreamHandle:
         await self._adapter._enqueue_write(payload)
         self._last_push = time.monotonic()
 
+    async def send_image(self, path: Path, *, filename: str | None = None) -> None:
+        await self._send_media(path, kind="image", filename=filename)
+
+    async def send_file(self, path: Path, *, filename: str | None = None) -> None:
+        await self._send_media(path, kind="file", filename=filename)
+
+    async def _send_media(self, path: Path, *, kind: str, filename: str | None) -> None:
+        data = path.read_bytes()
+        name = filename or path.name
+        media_id = await self._adapter.upload_media(data, kind=kind, filename=name)
+        payload = {
+            "cmd": "aibot_respond_msg",
+            "headers": {"req_id": self._req_id},
+            "body": {"msgtype": kind, kind: {"media_id": media_id}},
+        }
+        await self._adapter._enqueue_write(payload)
+
 
 class WeComBotAdapter(BotAdapter):
     def __init__(
@@ -140,6 +167,7 @@ class WeComBotAdapter(BotAdapter):
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
         self._workspace_resolver = workspace_resolver
+        self._pending_acks: dict[str, asyncio.Future] = {}
 
     # ---- BotAdapter interface ---------------------------------------------
 
@@ -236,8 +264,8 @@ class WeComBotAdapter(BotAdapter):
                     asyncio.create_task(self._handle_msg_callback(msg))
                 elif cmd == "aibot_event_callback":
                     asyncio.create_task(self._handle_event_callback(msg))
-                elif cmd == "" and msg.get("errmsg"):
-                    log.debug("ack: %s", msg)               # heartbeat / subscribe acks
+                elif cmd == "" and msg.get("errmsg") is not None:
+                    self._dispatch_ack(msg)                 # upload/heartbeat/subscribe acks
                 else:
                     log.debug("frame ignored: cmd=%s", cmd)
         except websockets.ConnectionClosed as err:
@@ -354,6 +382,86 @@ class WeComBotAdapter(BotAdapter):
             else:
                 chunks.append(f"[未支持的 mixed 子项: {it_type}]")
         return "\n".join(chunks).strip() or "(空消息)"
+
+    def _dispatch_ack(self, msg: dict[str, Any]) -> None:
+        req_id = (msg.get("headers") or {}).get("req_id")
+        fut = self._pending_acks.pop(req_id, None) if req_id else None
+        if fut is not None and not fut.done():
+            fut.set_result(msg)
+        else:
+            log.debug("ack: %s", msg)
+
+    async def _send_and_await(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout: float = UPLOAD_RESPONSE_TIMEOUT,
+    ) -> dict[str, Any]:
+        req_id = payload["headers"]["req_id"]
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_acks[req_id] = fut
+        try:
+            await self._enqueue_write(payload)
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._pending_acks.pop(req_id, None)
+
+    async def upload_media(self, data: bytes, *, kind: str, filename: str) -> str:
+        """Upload bytes via aibot_upload_media_init/chunk/finish; return media_id."""
+        if kind not in ("image", "file"):
+            raise RuntimeError(f"unsupported media kind: {kind}")
+        size = len(data)
+        if size < 5:
+            raise RuntimeError("file too small (WeCom requires ≥5 bytes)")
+        cap = MEDIA_SIZE_LIMITS[kind]
+        if size > cap:
+            raise RuntimeError(f"{kind} exceeds {cap} bytes (got {size})")
+        total_chunks = max(1, math.ceil(size / UPLOAD_CHUNK_SIZE))
+        md5 = hashlib.md5(data).hexdigest()
+
+        init_resp = await self._send_and_await({
+            "cmd": "aibot_upload_media_init",
+            "headers": {"req_id": _new_req_id()},
+            "body": {
+                "type": kind,
+                "filename": filename,
+                "total_size": size,
+                "total_chunks": total_chunks,
+                "md5": md5,
+            },
+        })
+        if init_resp.get("errcode") not in (0, None):
+            raise RuntimeError(f"upload_init failed: {init_resp!r}")
+        upload_id = (init_resp.get("body") or {}).get("upload_id") or ""
+        if not upload_id:
+            raise RuntimeError(f"upload_init missing upload_id: {init_resp!r}")
+
+        for idx in range(total_chunks):
+            chunk = data[idx * UPLOAD_CHUNK_SIZE : (idx + 1) * UPLOAD_CHUNK_SIZE]
+            chunk_resp = await self._send_and_await({
+                "cmd": "aibot_upload_media_chunk",
+                "headers": {"req_id": _new_req_id()},
+                "body": {
+                    "upload_id": upload_id,
+                    "chunk_index": idx,
+                    "base64_data": base64.b64encode(chunk).decode("ascii"),
+                },
+            })
+            if chunk_resp.get("errcode") not in (0, None):
+                raise RuntimeError(f"upload_chunk[{idx}] failed: {chunk_resp!r}")
+
+        finish_resp = await self._send_and_await({
+            "cmd": "aibot_upload_media_finish",
+            "headers": {"req_id": _new_req_id()},
+            "body": {"upload_id": upload_id},
+        })
+        if finish_resp.get("errcode") not in (0, None):
+            raise RuntimeError(f"upload_finish failed: {finish_resp!r}")
+        media_id = (finish_resp.get("body") or {}).get("media_id") or ""
+        if not media_id:
+            raise RuntimeError(f"upload_finish missing media_id: {finish_resp!r}")
+        return media_id
 
     async def _save_media(
         self,

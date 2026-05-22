@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 from ...llm.base import ToolSpec
 
 if TYPE_CHECKING:                       # avoid circular imports at runtime
+    from ...adapters.base import StreamHandle
     from ...config import Settings
     from ...session.session import Session
 
@@ -40,6 +41,7 @@ class ToolContext:
     cwd: Path
     session: "Session"
     settings: "Settings"
+    stream: "StreamHandle | None" = None
 
 
 class Tool(abc.ABC):

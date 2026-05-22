@@ -107,6 +107,12 @@ class StdoutStream:
     async def finish(self, final_text: str) -> None:  # noqa: ARG002
         return None
 
+    async def send_image(self, path: Path, *, filename: str | None = None) -> None:  # noqa: ARG002
+        raise NotImplementedError("boss CLI does not support media replies")
+
+    async def send_file(self, path: Path, *, filename: str | None = None) -> None:  # noqa: ARG002
+        raise NotImplementedError("boss CLI does not support media replies")
+
 
 def build_boss_tool_registry() -> ToolRegistry:
     reg = ToolRegistry()
