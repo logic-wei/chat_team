@@ -20,6 +20,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 os.environ["CHAT_TEAM_HOME"] = "/tmp/chat_team_compact_smoke"
 shutil.rmtree(os.environ["CHAT_TEAM_HOME"], ignore_errors=True)
 
+# Seed a test-only `engineer` role so the smoke doesn't depend on the builtin
+# set (which intentionally only ships team_admin). Used by the persistence
+# round-trip test that transfers admin → engineer.
+_roles_dir = Path(os.environ["CHAT_TEAM_HOME"]) / "roles"
+_roles_dir.mkdir(parents=True, exist_ok=True)
+(_roles_dir / "engineer.yaml").write_text(
+    "name: engineer\n"
+    "display_name: 测试工程师\n"
+    "system_prompt: |\n"
+    "  你是测试用的研发同事。\n"
+    "tools:\n"
+    "  - notebook_read\n"
+    "  - notebook_write\n"
+    "  - transfer_to_employee\n"
+    "llm:\n"
+    "  temperature: 0.2\n"
+    "  history_token_budget: 16000\n",
+    encoding="utf-8",
+)
+
 from chat_team.adapters.base import ChatType, IncomingMessage
 from chat_team.agent.agent import Agent
 from chat_team.agent.compactor import count_tokens, maybe_compact
@@ -179,7 +199,7 @@ async def test_persistence_round_trip():
                 role="assistant", content="",
                 tool_calls=[ToolCall(
                     id="tc1", name="transfer_to_employee",
-                    arguments={"employee": "research_engineer", "reason": "讨论代码", "handoff_note": "用户想看代码"},
+                    arguments={"employee": "engineer", "reason": "讨论代码", "handoff_note": "用户想看代码"},
                 )],
             ),
             finish_reason="tool_calls",
@@ -201,24 +221,24 @@ async def test_persistence_round_trip():
     print("  turn2 final:", s2.final)
 
     sess = sessions.get_or_create("sess-persist")
-    assert sess.current_role == "research_engineer"
+    assert sess.current_role == "engineer"
     persistence.flush_now(sess)
 
     # Verify file exists and has expected shape
     state = load_state(sess.cwd)
     assert state is not None
-    assert state["current_role"] == "research_engineer"
+    assert state["current_role"] == "engineer"
     assert "team_admin" in state["histories"]
-    assert "research_engineer" in state["histories"]
+    assert "engineer" in state["histories"]
     print("  ✓ session.json written; roles:", list(state["histories"].keys()))
 
     # Build a brand-new SessionManager pointing at the same workspace_root —
     # it should restore current_role and per-role histories from disk.
     sessions2 = SessionManager(settings)
     sess2 = sessions2.get_or_create("sess-persist")
-    assert sess2.current_role == "research_engineer"
+    assert sess2.current_role == "engineer"
     assert "team_admin" in sess2.restored_histories
-    assert "research_engineer" in sess2.restored_histories
+    assert "engineer" in sess2.restored_histories
     admin_history = sess2.restored_histories["team_admin"]
     assert any(m.role == "user" and "你好" in (m.content or "") for m in admin_history)
     print("  ✓ restored to fresh SessionManager:",
@@ -235,7 +255,7 @@ async def test_persistence_round_trip():
     s3 = CapturingStream()
     await disp2.handle(msg("sess-persist", "继续"), s3)
     print("  turn3 final:", s3.final)
-    eng_agent = sess2.agents_by_role["research_engineer"]
+    eng_agent = sess2.agents_by_role["engineer"]
     # restored history (3 messages from turn 2) + new turn (user + assistant) = 5
     assert any(
         m.role == "assistant" and "我是小研" in (m.content or "")

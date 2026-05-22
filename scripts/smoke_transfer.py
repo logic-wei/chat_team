@@ -17,6 +17,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 os.environ["CHAT_TEAM_HOME"] = "/tmp/chat_team_transfer_smoke"
 shutil.rmtree(os.environ["CHAT_TEAM_HOME"], ignore_errors=True)
 
+# Seed two test-only roles so this smoke doesn't depend on the builtin set
+# (which intentionally only ships team_admin). The fake LLM is scripted, so
+# only the role *names* matter here — prompts and tool lists are minimal.
+_roles_dir = Path(os.environ["CHAT_TEAM_HOME"]) / "roles"
+_roles_dir.mkdir(parents=True, exist_ok=True)
+for _name, _display in (("engineer", "测试工程师"), ("customer", "测试客服")):
+    (_roles_dir / f"{_name}.yaml").write_text(
+        f"name: {_name}\n"
+        f"display_name: {_display}\n"
+        "system_prompt: |\n"
+        f"  你是测试用的 {_display}。\n"
+        "tools:\n"
+        "  - notebook_read\n"
+        "  - notebook_write\n"
+        "  - transfer_to_employee\n"
+        "llm:\n"
+        "  temperature: 0.3\n",
+        encoding="utf-8",
+    )
+
 from chat_team.adapters.base import ChatType, IncomingMessage
 from chat_team.agent.tools.base import ToolRegistry
 from chat_team.agent.tools.file_tools import ListDirTool, ReadFileTool, WriteFileTool
@@ -98,8 +118,8 @@ async def test_chain_within_cap():
     print("== test 1: admin → engineer → customer (within cap=3) ==")
     settings = load_settings()
     llm = ScriptedLLM([
-        transfer("research_engineer", "用户先看代码", "tc1"),
-        transfer("customer_service", "代码看完了,后续是答疑", "tc2"),
+        transfer("engineer", "用户先看代码", "tc1"),
+        transfer("customer", "代码看完了,后续是答疑", "tc2"),
         reply("你好,我是小客,有什么问题尽管问。"),
     ])
     disp = build(settings, llm)
@@ -108,7 +128,7 @@ async def test_chain_within_cap():
     sess = disp.sessions.get_or_create("sess-A")
     print("  final:", s.final)
     print("  current_role:", sess.current_role)
-    assert sess.current_role == "customer_service"
+    assert sess.current_role == "customer"
     assert "小客" in s.final
 
     # The handoff note is a one-shot system inject — it lives in the
@@ -131,8 +151,8 @@ async def test_cap_forces_answer():
     settings = load_settings()
     settings.session.per_turn_transfer_cap = 2  # tighten so we don't need many scripts
     llm = ScriptedLLM([
-        transfer("research_engineer", "n1", "t1"),   # 1st transfer
-        transfer("customer_service", "n2", "t2"),    # 2nd → hits cap (>=2)
+        transfer("engineer", "n1", "t1"),   # 1st transfer
+        transfer("customer", "n2", "t2"),   # 2nd → hits cap (>=2)
         # forced answer call by the customer agent
         reply("(在客服位上被强制回答)抱歉,我来直接回答:你好,有什么可以帮你?"),
     ])

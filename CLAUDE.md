@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A WeCom (企业微信) AI Bot that fronts a team of role-differentiated "virtual employees" (currently `team_admin` / `research_engineer` / `customer_service`). One employee handles a session at a time; the LLM transfers control via a `transfer_to_employee` tool call. Each chat session gets its own working directory; sessions are fully isolated.
+A WeCom (企业微信) AI Bot that fronts a team of role-differentiated "virtual employees". The only builtin role is `team_admin` (the front-desk/receptionist); every other role is user-defined as a YAML in `~/.chat_team/roles/`. Sample non-builtin roles (`research_engineer`, `customer_service`) live under `docs/examples/roles/` for users to copy. One employee handles a session at a time; the LLM transfers control via a `transfer_to_employee` tool call. Each chat session gets its own working directory; sessions are fully isolated.
 
 ## Commands
 

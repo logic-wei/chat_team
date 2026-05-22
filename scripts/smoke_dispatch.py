@@ -109,6 +109,30 @@ async def main() -> None:
     shutil.rmtree(home, ignore_errors=True)
     import os
     os.environ["CHAT_TEAM_HOME"] = str(home)
+
+    # Seed a test-only role so the smoke doesn't depend on the builtin set,
+    # which intentionally ships with only `team_admin`.
+    roles_dir = home / "roles"
+    roles_dir.mkdir(parents=True, exist_ok=True)
+    (roles_dir / "engineer.yaml").write_text(
+        "name: engineer\n"
+        "display_name: 测试工程师\n"
+        "system_prompt: |\n"
+        "  你是测试用的研发同事。\n"
+        "tools:\n"
+        "  - read_file\n"
+        "  - write_file\n"
+        "  - list_dir\n"
+        "  - run_command\n"
+        "  - notebook_read\n"
+        "  - notebook_write\n"
+        "  - transfer_to_employee\n"
+        "llm:\n"
+        "  temperature: 0.2\n"
+        "  history_token_budget: 16000\n",
+        encoding="utf-8",
+    )
+
     settings = load_settings()
 
     # ---- Test 1: admin replies directly without tool use --------------------
@@ -120,11 +144,11 @@ async def main() -> None:
     assert s.final and "小管" in s.final, f"final={s.final!r}"
     print("  final:", s.final)
 
-    # ---- Test 2: admin transfers to research_engineer -----------------------
+    # ---- Test 2: admin transfers to the seeded test engineer role -----------
     print("== test 2: admin → engineer transfer ==")
     llm2 = ScriptedLLM([
         call("transfer_to_employee", {
-            "employee": "research_engineer",
+            "employee": "engineer",
             "reason": "用户需要看代码",
             "handoff_note": "用户想了解 src/main.py,请帮看",
         }, call_id="tc-transfer"),
@@ -137,7 +161,7 @@ async def main() -> None:
     print("  final:", s2.final)
     assert s2.final and "小研" in s2.final
     sess = disp2.sessions.get_or_create("wecom-single-bot1-u2")
-    assert sess.current_role == "research_engineer", sess.current_role
+    assert sess.current_role == "engineer", sess.current_role
     print("  current_role after turn:", sess.current_role)
 
     # ---- Test 3: notebook write + read --------------------------------------
