@@ -8,7 +8,14 @@ import os
 
 from .adapters.base import BotAdapter
 from .agent.tools.base import ToolRegistry
-from .agent.tools.file_tools import ListDirTool, ReadFileTool, WriteFileTool
+from .agent.tools.file_tools import (
+    EditFileTool,
+    GlobTool,
+    GrepTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
 from .agent.tools.media_tools import SendFileTool, SendImageTool
 from .agent.tools.notebook_tools import (
     NotebookDeleteTool,
@@ -32,7 +39,10 @@ def build_tool_registry(roles: RoleRegistry) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(ReadFileTool())
     reg.register(WriteFileTool())
+    reg.register(EditFileTool())
     reg.register(ListDirTool())
+    reg.register(GlobTool())
+    reg.register(GrepTool())
     reg.register(RunCommandTool())
     reg.register(NotebookReadTool())
     reg.register(NotebookWriteTool())
