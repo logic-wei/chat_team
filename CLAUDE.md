@@ -20,6 +20,11 @@ python scripts/smoke_tools.py                     # write/read/list/run_command 
 python scripts/smoke_wecom_parse.py               # adapter parse + LRU + stream frame shape
 python scripts/smoke_compaction_persistence.py    # tiktoken compaction + session.json round-trip
 python scripts/smoke_media_events.py              # AES-256-CBC decrypt + enter_chat/disconnected
+python scripts/smoke_team_profile.py              # team.md injection + compactor isolation
+python scripts/smoke_boss.py                      # CLI boss agent + team_tools
+
+# Conversational team-setup CLI (not the WeCom bot — see "Boss agent" below).
+chat-team-boss
 ```
 
 There is no test framework — smokes are async `main()` scripts that print and assert. Add new smokes alongside the existing ones; they all set `CHAT_TEAM_HOME=/tmp/...` and `shutil.rmtree` it at startup so they don't pollute the real `~/.chat_team`.
@@ -66,6 +71,18 @@ Tool              ── ToolContext(cwd, session, settings); sandboxed I/O
 
 **One Agent = one role × one session.** Histories are NEVER shared across roles. Cross-role facts go through `notebook.md` (a Markdown file with `## key` blocks) — agents see only the TOC injected into their system prompt, and fetch values via `notebook_read`.
 
+### Boss agent (CLI-only)
+
+`src/chat_team/boss.py` is a separate entry point (`chat-team-boss`) that reuses `Agent` + `LLMProvider` + a fresh `ToolRegistry` of `team_tools`. It runs a stdin/stdout chat loop so the user can shape `~/.chat_team/team.md` and `~/.chat_team/roles/*.yaml` conversationally instead of hand-editing YAML.
+
+Key isolation points:
+- **`BOSS_ROLE` is hardcoded in `boss.py`** and is NOT registered in `RoleRegistry`. The WeCom-side `transfer_to_employee` enum and `enter_chat` flow never see it.
+- **Boss tools** (`agent/tools/team_tools.py`) deliberately bypass the cwd sandbox and operate on absolute paths under `settings.paths.user_roles_dir` / `settings.paths.team_md`. They are NOT registered in `app.build_tool_registry` and never reach the dispatcher.
+- **`list_available_tools`** dynamically calls `app.build_tool_registry(RoleRegistry({}))` to enumerate the *main-runtime* tool catalog so the boss recommends valid `tools:` names — picks up any new tool without editing the boss.
+- **`write_role`** validates input (yaml parse → `Role.from_dict` → name match → atomic write) before touching disk; bad YAML returns `ToolError` and the LLM self-corrects on retry.
+- **Confirmation is by-prompt, not by-CLI**: the boss's system prompt requires it to paste the full proposed YAML/markdown to the user and ask "是否确认写入?" before invoking any write tool. There is no separate y/N gate.
+- **No persistence**: each `chat-team-boss` invocation starts a fresh chat. The durable state lives in the role YAMLs and `team.md` it edits.
+
 ## Non-obvious mechanics
 
 **Transfer flow.** `transfer_to_employee` raises `TransferRequested` (a special exception, not a `ToolError`). It bubbles from tool → agent → dispatcher. Before re-raising, the agent appends a synthetic `tool` message (`"[transferred] target=X"`) to its OWN history so the dangling `tool_calls` is closed — otherwise reopening that role later breaks OpenAI history validation. The dispatcher catches it, increments `transfer_count_this_turn`, and either:
@@ -104,3 +121,5 @@ Tool              ── ToolContext(cwd, session, settings); sandboxed I/O
 - **Don't call `ws.send` directly from anywhere except the writer task.** Use `_enqueue_write`.
 - **Don't share notebooks or histories across sessions.** Each `Session` instance owns its own `Notebook` pointed at its own `notebook.md`; SessionManager keys by raw `session_id` (sanitization is path-only).
 - **Don't catch `TransferRequested` in tools.** Only `Agent.handle` (which closes the dangling tool_call) and `Dispatcher._run_turn` (which acts on it) should see it.
+- **Don't put `BOSS_ROLE` into `roles/builtin/` or any user role dir.** It would be picked up by `RoleRegistry.load` and leak into `transfer_to_employee`'s enum + WeCom's enter_chat flow. Boss must stay hardcoded in `boss.py` and registered nowhere.
+- **Don't add boss-side tools (`team_tools.py`) to `app.build_tool_registry`.** They sidestep the cwd sandbox by design and would let any WeCom-side role overwrite arbitrary files under `~/.chat_team/`.

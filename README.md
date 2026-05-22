@@ -91,7 +91,29 @@ INFO chat_team.adapters.wecom | subscribe ok: {...errcode: 0...}
 之后就可以在企微里 @ 机器人或单聊。日志同时打到 stderr 和 `~/.chat_team/logs/chat_team.log`
 (按 10MB × 5 份轮转)。
 
+## `chat-team-boss`(配置助手)
+
+不愿手写 YAML?`pip install -e .` 之后跑:
+
+```bash
+chat-team-boss
+```
+
+会进入一个**命令行对话**:你用中文说想要什么样的虚拟员工/团队画像,boss 替你读写
+`~/.chat_team/team.md` 和 `~/.chat_team/roles/*.yaml`。它会先把待写入的完整 YAML/markdown
+贴给你看、明确询问"是否确认写入",得到肯定回复后再落盘。
+
+- **会话不持久化**:每次启动从零开始;真正的"记忆"是落到磁盘上的那些文件。
+- **不上企微**:boss 角色仅在 CLI,**不会**出现在 `transfer_to_employee` 的员工枚举里,
+  也不会被 enter_chat 触发。
+- **改完即可**:`Ctrl+D` 或 `/quit` 退出,然后用 `chat-team` 启动主机器人即可生效
+  (角色注册表在主进程启动时一次性加载)。
+
+需要 `OPENAI_API_KEY`(同主机器人,从 `~/.chat_team/.env` 读)。
+
 ## 加一个角色
+
+不想手写?用 `chat-team-boss`(见上一节)让它替你写。手写示例:
 
 ```yaml
 # ~/.chat_team/roles/data_analyst.yaml

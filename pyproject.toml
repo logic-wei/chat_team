@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 chat-team = "chat_team.app:run"
+chat-team-boss = "chat_team.boss:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]
