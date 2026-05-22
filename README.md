@@ -41,6 +41,7 @@ pip install -e .
 ~/.chat_team/
   config.yaml      # 全局参数 (token 预算、shell 超时、日志轮转……)
   .env             # 凭证 (mode 0600);WECOM_BOT_ID / WECOM_SECRET / OPENAI_*
+  team.md          # 全局团队画像;非空时每轮注入到所有员工的 system prompt;改后需重启
   roles/           # 用户自定义角色 YAML,同名优先于内置
   workspaces/      # 每个会话一个子目录
   logs/            # chat_team.log,RotatingFileHandler
@@ -57,6 +58,16 @@ OPENAI_BASE_URL=https://api.openai.com/v1   # 替换成内部代理 / vLLM / Oll
 ```
 
 测试时可用 `CHAT_TEAM_HOME=/tmp/chat_team_dev` 把整个根目录搬走,避免污染真实环境。
+
+### 团队画像 (`team.md`)
+
+`~/.chat_team/team.md` 是自由 markdown 文本,非空时启动会原样读入,在每个虚拟员工
+**每一轮**的 system prompt 里以 `[团队信息]` 块注入 —— 让所有角色都知道自己服务于
+哪个公司/团队,而不必在每个角色 YAML 里复制相同的话术。
+
+- 修改后**需要重启** `chat-team` 才能生效(配置启动时一次性加载)。
+- 不需要这个能力时把整个文件清空即可,行为完全等价于"未配置"。
+- 建议正文不超过 300 字,过长会推高每轮 API token 消耗。
 
 ## 运行
 

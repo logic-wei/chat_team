@@ -32,6 +32,7 @@ All persistent state lives under `~/.chat_team/` (override with `CHAT_TEAM_HOME`
 ~/.chat_team/
   config.yaml              # global knobs; defaults written on first run
   .env                     # WECOM_BOT_ID, WECOM_SECRET, OPENAI_API_KEY, OPENAI_BASE_URL
+  team.md                  # global team profile; injected into every agent's system prompt
   roles/                   # user-defined role YAMLs override builtins by name
   workspaces/<sid>/        # one per chat session
     inbox/                 # decrypted inbound media lands here
@@ -88,6 +89,8 @@ Tool              ── ToolContext(cwd, session, settings); sandboxed I/O
 **Media decryption.** Each `image`/`file`/`video` payload carries its own per-URL `aeskey` (NOT the global EncodingAESKey from registration). Decode base64 → 32 bytes (AES-256). IV = first 16 bytes. AES-CBC + PKCS#7. The download URL is valid for 5 minutes — fetch immediately. Files land in `<cwd>/inbox/<ts>-<msgid>.<ext>`; extension comes from magic-byte sniffing (jpg/png/gif/webp/pdf/zip/mp4) or the msgtype default. The adapter's `workspace_resolver` callback (wired from `SessionManager.workspace_for`) decides where they go.
 
 **Tool sandbox.** `_resolve_under(cwd, rel)` rejects absolute paths and `..`, then double-checks via `os.path.realpath` + `os.path.commonpath`. `list_dir` hides anything starting with `.chat_team` so the LLM doesn't see internal metadata. `run_command` runs through `bash -c` with `cwd=ctx.cwd`, hard timeout from settings, output truncated to `shell_output_max_bytes` (full log to `.chat_team/runs/<ts>-<rand>.log` so the LLM can re-read via `read_file` if needed).
+
+**Team profile injection.** `~/.chat_team/team.md` is read once by `load_settings` into `settings.team_profile` (stripped); when non-empty, `Agent._build_system_messages` splices it as a `[团队信息]` block alongside the role prompt and meta lines. Empty/missing file → no block, behaviour unchanged. The compactor's `_summarize` uses its own sterile system prompt (`compactor.py:100-107`) and is intentionally NOT touched. No hot reload — edits to `team.md` only take effect on the next `chat-team` start.
 
 ## Adding a role / tool
 

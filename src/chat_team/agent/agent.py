@@ -59,16 +59,15 @@ class Agent:
 
     def _build_system_messages(self) -> list[ChatMessage]:
         toc = self.session.notebook.toc()
-        roster = sorted(self.tools.specs_for(self._all_employee_roster_keys()))  # type: ignore
-        # roster is unused here; left as future extension hook.
-        del roster
-        sys_text = self.role.system_prompt
-        meta_lines = [
+        blocks: list[str] = [self.role.system_prompt]
+        if self.settings.team_profile:
+            blocks.append("[团队信息]\n" + self.settings.team_profile)
+        blocks.append("\n".join([
             f"[当前角色] {self.role.name} ({self.role.display_name})",
             f"[团队记事本目录] {toc}",
             "[隔离规则] 你只看得到自己的对话历史;切换员工后,新同事看不到你的轨迹。",
-        ]
-        full = (sys_text + "\n\n" + "\n".join(meta_lines)).strip()
+        ]))
+        full = "\n\n".join(b for b in blocks if b).strip()
         msgs = [ChatMessage(role="system", content=full)]
         for note in self.pending_system_inject:
             msgs.append(ChatMessage(role="system", content=note))

@@ -57,6 +57,7 @@ class Settings:
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    team_profile: str = ""
     env: dict[str, str] = field(default_factory=dict)
 
     def get_env(self, key: str, default: str | None = None) -> str | None:
@@ -105,5 +106,7 @@ def load_settings(paths: Paths | None = None) -> Settings:
         k: v for k, v in os.environ.items()
         if k.startswith(("WECOM_", "OPENAI_", "CHAT_TEAM_"))
     }
+    if paths.team_md.exists():
+        settings.team_profile = paths.team_md.read_text(encoding="utf-8").strip()
     workspace_root.mkdir(parents=True, exist_ok=True)
     return settings

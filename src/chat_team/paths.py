@@ -21,6 +21,7 @@ class Paths:
     home: Path
     config_yaml: Path
     dotenv: Path
+    team_md: Path
     user_roles_dir: Path
     workspaces_dir: Path
     logs_dir: Path
@@ -56,6 +57,7 @@ def init_home(home: Path | None = None) -> Paths:
         home=root,
         config_yaml=root / "config.yaml",
         dotenv=root / ".env",
+        team_md=root / "team.md",
         user_roles_dir=root / "roles",
         workspaces_dir=root / "workspaces",
         logs_dir=root / "logs",
@@ -73,5 +75,7 @@ def init_home(home: Path | None = None) -> Paths:
             os.chmod(paths.dotenv, 0o600)
         except OSError:
             pass
+    if not paths.team_md.exists():
+        paths.team_md.write_text(_load_template("team.md"), encoding="utf-8")
 
     return paths
