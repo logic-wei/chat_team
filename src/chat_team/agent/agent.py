@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from ..adapters.base import StreamHandle
+from ..adapters.base import ContentBlock, StreamHandle
 from ..config import Settings
 from ..llm.base import (
     ChatMessage,
@@ -80,8 +80,15 @@ class Agent:
 
     # ---- main loop ---------------------------------------------------------
 
-    async def handle(self, user_text: str, stream: StreamHandle) -> str:
-        self.history.append(ChatMessage(role="user", content=user_text))
+    async def handle(
+        self,
+        user_content: str | list[ContentBlock],
+        stream: StreamHandle,
+    ) -> str:
+        # Accept either a flat string (legacy / synthetic system-injected
+        # turns from the dispatcher) or a list of ContentBlocks (multi-modal
+        # user message from the adapter).
+        self.history.append(ChatMessage(role="user", content=user_content))
 
         for loop_idx in range(MAX_TOOL_LOOPS):
             sys_msgs = self._build_system_messages()
@@ -90,6 +97,8 @@ class Agent:
                 tools=self.tools.specs_for(self.role.tools),
                 model=self._model(),
                 temperature=self._temperature(),
+                image_detail=self._image_detail(),
+                image_base_dir=self.session.cwd,
             )
             response = await self.llm.complete(request)
             assistant = response.message
@@ -149,3 +158,9 @@ class Agent:
         if self.role.llm.temperature is None:
             return self.settings.llm.default_temperature
         return self.role.llm.temperature
+
+    def _image_detail(self) -> str:
+        return (
+            self.role.llm.image_detail
+            or self.settings.llm.default_image_detail
+        )

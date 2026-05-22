@@ -39,7 +39,11 @@ STATE_FILENAME = "session.json"
 
 
 def _serialize_message(m: ChatMessage) -> dict[str, Any]:
-    d: dict[str, Any] = {"role": m.role, "content": m.content or ""}
+    if isinstance(m.content, list):
+        content: Any = m.content
+    else:
+        content = m.content or ""
+    d: dict[str, Any] = {"role": m.role, "content": content}
     if m.tool_calls:
         d["tool_calls"] = [
             {"id": c.id, "name": c.name, "arguments": c.arguments or {}}
@@ -61,9 +65,11 @@ def _deserialize_message(d: dict[str, Any]) -> ChatMessage:
         )
         for tc in (d.get("tool_calls") or [])
     ]
+    raw = d.get("content")
+    content: Any = raw if isinstance(raw, list) else (raw or "")
     return ChatMessage(
         role=d.get("role", "user"),
-        content=d.get("content") or "",
+        content=content,
         tool_calls=tool_calls,
         tool_call_id=d.get("tool_call_id"),
         name=d.get("name"),

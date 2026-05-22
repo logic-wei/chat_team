@@ -27,6 +27,7 @@ llm:
   default_model: gpt-4o-mini
   default_temperature: 0.3
   default_history_token_budget: 12000  # per-role; tighter values trigger compaction sooner
+  default_image_detail: high         # vision tile granularity: low | high | auto. high ≈ 1600 tokens / 1024² image — bump history budget if you keep many images in context, or set "low" per-role.
 
 logging:
   max_bytes: 10485760                # 10 MB per log file

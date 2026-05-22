@@ -57,6 +57,8 @@ from chat_team.roles.registry import RoleRegistry
 from chat_team.session.manager import SessionManager
 from chat_team.session.persistence import (
     PersistenceManager,
+    _deserialize_message,
+    _serialize_message,
     load_state,
     restored_histories,
 )
@@ -286,11 +288,42 @@ async def test_persistence_debounced_fires():
     print("  ✓ session.json appeared after debounce window")
 
 
+async def test_persistence_list_content_round_trip():
+    print("== test 5: list content round-trips through persistence ==")
+    blocks = [
+        {"type": "text", "text": "看这两张"},
+        {"type": "image", "path": "./inbox/a.jpg"},
+        {"type": "image", "path": "./inbox/b.png"},
+        {"type": "text", "text": "对比一下"},
+    ]
+    msg = ChatMessage(role="user", content=blocks)
+    d = _serialize_message(msg)
+    assert isinstance(d["content"], list)
+    assert d["content"][1] == {"type": "image", "path": "./inbox/a.jpg"}
+
+    # JSON survives the round-trip
+    import json
+    redeserialized = _deserialize_message(json.loads(json.dumps(d)))
+    assert isinstance(redeserialized.content, list)
+    assert len(redeserialized.content) == 4
+    assert redeserialized.content[1]["type"] == "image"
+    assert redeserialized.content[3]["text"] == "对比一下"
+    print("  ✓ list content survives serialize → JSON → deserialize")
+
+    # Legacy string-content still loads as string
+    legacy = {"role": "user", "content": "你好"}
+    legacy_msg = _deserialize_message(legacy)
+    assert isinstance(legacy_msg.content, str)
+    assert legacy_msg.content == "你好"
+    print("  ✓ legacy string-content session.json loads unchanged")
+
+
 async def main():
     await test_compactor_prefix_summarised()
     await test_compactor_skipped_when_under_budget()
     await test_persistence_round_trip()
     await test_persistence_debounced_fires()
+    await test_persistence_list_content_round_trip()
     print("\nALL STAGE-6 SMOKE TESTS PASSED")
 
 

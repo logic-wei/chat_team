@@ -34,9 +34,12 @@ from . import wecom_media
 from .base import (
     BotAdapter,
     ChatType,
+    ContentBlock,
     IncomingMessage,
     MessageHandler,
     StreamHandle,
+    blocks_to_text,
+    coalesce_text_blocks,
 )
 
 WorkspaceResolver = Callable[[str], Path]
@@ -56,6 +59,21 @@ MEDIA_SIZE_LIMITS = {
 }
 
 _MENTION_RE = re.compile(r"^@\S+\s+")
+
+
+def _strip_mention_from_first_text(blocks: list[ContentBlock]) -> list[ContentBlock]:
+    """Remove a leading ``@bot `` mention from the first text block.
+    Image / non-text blocks before the first text block are preserved as-is.
+    Quote markers (added later) live after this strip is applied to the
+    current-message side, so quote interiors are never touched."""
+    out = list(blocks)
+    for i, block in enumerate(out):
+        if block.get("type") == "text":
+            text = (block.get("text") or "")
+            stripped = _MENTION_RE.sub("", text, count=1).strip()
+            out[i] = {"type": "text", "text": stripped}
+            break
+    return out
 
 
 def _new_req_id() -> str:
@@ -294,16 +312,21 @@ class WeComBotAdapter(BotAdapter):
 
         msgtype = body.get("msgtype") or "text"
         try:
-            text = await self._resolve_inbound_text(body, msgtype, inbound.session_id)
+            blocks = await self._resolve_inbound_blocks(
+                body, msgtype, inbound.session_id, inbound.chat_type,
+            )
         except Exception:                                    # noqa: BLE001
-            log.exception("failed to resolve inbound text for msgtype=%s", msgtype)
-            text = f"[用户发来 {msgtype},但下载/解密失败]"
-        if text is None:
+            log.exception("failed to resolve inbound blocks for msgtype=%s", msgtype)
+            blocks = [{"type": "text",
+                       "text": f"[用户发来 {msgtype},但下载/解密失败]"}]
+        if blocks is None:
             log.info("unsupported msgtype=%s; ignoring", msgtype)
             return
-        if inbound.chat_type == ChatType.GROUP:
-            text = _MENTION_RE.sub("", text, count=1).strip()
-        inbound.text = text
+        blocks = coalesce_text_blocks(blocks)
+        if not blocks:
+            blocks = [{"type": "text", "text": "(空消息)"}]
+        inbound.content_blocks = blocks
+        inbound.text = blocks_to_text(blocks)
 
         handler = self._handler
         if handler is None:
@@ -349,39 +372,116 @@ class WeComBotAdapter(BotAdapter):
             raw=body,
         )
 
-    async def _resolve_inbound_text(
-        self, body: dict[str, Any], msgtype: str, session_id: str
-    ) -> str | None:
-        if msgtype == "text":
-            return ((body.get("text") or {}).get("content") or "").strip()
-        if msgtype == "voice":
-            return ((body.get("voice") or {}).get("content") or "").strip() or None
-        if msgtype == "mixed":
-            return await self._resolve_mixed(body, session_id)
-        if msgtype in ("image", "file", "video"):
-            payload = body.get(msgtype) or {}
-            saved = await self._save_media(payload, msgtype, session_id, body.get("msgid") or "")
-            return saved or f"[用户发来 {msgtype},但下载失败]"
-        return None
+    async def _resolve_inbound_blocks(
+        self,
+        body: dict[str, Any],
+        msgtype: str,
+        session_id: str,
+        chat_type: ChatType,
+    ) -> list[ContentBlock] | None:
+        """Build the ordered content-block list for an inbound message body.
 
-    async def _resolve_mixed(self, body: dict[str, Any], session_id: str) -> str:
-        items = (body.get("mixed") or {}).get("msg_item") or []
-        chunks: list[str] = []
-        for idx, it in enumerate(items):
-            it_type = it.get("msgtype") or ""
-            if it_type == "text":
-                content = (it.get("text") or {}).get("content") or ""
-                if content.strip():
-                    chunks.append(content.strip())
-            elif it_type == "image":
-                saved = await self._save_media(
-                    it.get("image") or {}, "image", session_id,
-                    f"{body.get('msgid') or 'mixed'}-{idx}",
+        Handles WeCom's sibling ``quote`` field by recursively flattening
+        the quote payload and prefixing the current-message blocks with
+        text-boundary markers so the LLM can tell what was quoted vs. what
+        the user just sent. The group ``@bot `` mention strip is applied to
+        the first text block of the *current* message side only — never to
+        the quote interior or the marker blocks.
+
+        Returns ``None`` for genuinely unsupported msgtypes so the caller
+        can drop the message; otherwise always returns a non-empty list.
+        """
+        msg_id = body.get("msgid") or ""
+        # voice msgtype is unique: WeCom delivers it pre-transcribed text,
+        # not media to download. Empty transcription → drop entirely.
+        if msgtype == "voice":
+            transcribed = ((body.get("voice") or {}).get("content") or "").strip()
+            current_blocks: list[ContentBlock] = (
+                [{"type": "text", "text": transcribed}] if transcribed else []
+            )
+            if not current_blocks and not body.get("quote"):
+                return None
+        else:
+            current_blocks = await self._flatten_payload(
+                body, msgtype, session_id, msg_id, idx=0,
+            )
+
+        if chat_type == ChatType.GROUP:
+            current_blocks = _strip_mention_from_first_text(current_blocks)
+
+        quote = body.get("quote") or {}
+        if quote and quote.get("msgtype"):
+            quote_blocks = await self._flatten_payload(
+                quote, quote.get("msgtype"), session_id, f"{msg_id}-q", idx=0,
+            )
+        else:
+            quote_blocks = []
+
+        if not quote_blocks:
+            return current_blocks or [{"type": "text", "text": "(空消息)"}]
+
+        # Wrap the quote in text-boundary markers so the model can
+        # distinguish quoted context from the new message body.
+        return (
+            [{"type": "text", "text": "[引用开始]"}]
+            + quote_blocks
+            + [{"type": "text", "text": "[引用结束 — 以下为本条新消息]"}]
+            + current_blocks
+        )
+
+    async def _flatten_payload(
+        self,
+        payload: dict[str, Any],
+        msgtype: str,
+        session_id: str,
+        msg_id: str,
+        *,
+        idx: int = 0,
+    ) -> list[ContentBlock]:
+        """Recursively flatten a WeCom message body (or a quote sub-payload)
+        into an ordered ContentBlock list. Handles ``text``, ``image``,
+        ``mixed`` (recurses into ``msg_item``), and falls back to a text
+        placeholder for ``voice`` / ``file`` / ``video`` (their bytes are
+        saved to inbox but not sent to the LLM as vision)."""
+        if msgtype == "text":
+            content = ((payload.get("text") or {}).get("content") or "").strip()
+            return [{"type": "text", "text": content}] if content else []
+
+        if msgtype == "image":
+            image_payload = payload.get("image") or {}
+            rel = await self._save_media_bytes(
+                image_payload, "image", session_id, f"{msg_id or 'msg'}-{idx}",
+            )
+            if rel is None:
+                return [{"type": "text", "text": "[图片下载失败]"}]
+            return [{"type": "image", "path": rel}]
+
+        if msgtype == "mixed":
+            items = (payload.get("mixed") or {}).get("msg_item") or []
+            # Sequential iteration (rather than asyncio.gather) keeps things
+            # simple; ordering is preserved by construction. WeCom rarely
+            # delivers more than a handful of items per mixed message.
+            blocks: list[ContentBlock] = []
+            for i, it in enumerate(items):
+                it_type = it.get("msgtype") or ""
+                sub = await self._flatten_payload(
+                    it, it_type, session_id, msg_id, idx=i,
                 )
-                chunks.append(saved or "[图片下载失败]")
-            else:
-                chunks.append(f"[未支持的 mixed 子项: {it_type}]")
-        return "\n".join(chunks).strip() or "(空消息)"
+                if not sub and it_type:
+                    sub = [{"type": "text", "text": f"[未支持的 mixed 子项: {it_type}]"}]
+                blocks.extend(sub)
+            return blocks
+
+        if msgtype in ("file", "video"):
+            sub_payload = payload.get(msgtype) or {}
+            placeholder = await self._save_media_placeholder(
+                sub_payload, msgtype, session_id, f"{msg_id or 'msg'}-{idx}",
+            )
+            return [{"type": "text", "text": placeholder}]
+
+        # Anything else: emit a text placeholder so the message is still
+        # routable rather than silently dropped.
+        return [{"type": "text", "text": f"[未支持: {msgtype}]"}]
 
     def _dispatch_ack(self, msg: dict[str, Any]) -> None:
         req_id = (msg.get("headers") or {}).get("req_id")
@@ -463,13 +563,21 @@ class WeComBotAdapter(BotAdapter):
             raise RuntimeError(f"upload_finish missing media_id: {finish_resp!r}")
         return media_id
 
-    async def _save_media(
+    async def _save_media_bytes(
         self,
         payload: dict[str, Any],
         msgtype: str,
         session_id: str,
         media_tag: str,
     ) -> str | None:
+        """Download + decrypt + persist media bytes to the session's inbox.
+
+        Returns the workspace-relative path (``./inbox/<file>``) on success
+        or ``None`` on any failure. Caller decides how to render failure —
+        image flow turns it into a text block, file/video flow into a
+        placeholder string. ``media_tag`` typically encodes msgid + index
+        so concurrent downloads don't collide on the same-second filename.
+        """
         url = payload.get("url") or ""
         aeskey = payload.get("aeskey") or ""
         if not url or not aeskey:
@@ -492,8 +600,28 @@ class WeComBotAdapter(BotAdapter):
         fname = f"{ts}-{safe_tag}.{ext}"
         out = inbox / fname
         out.write_bytes(plain)
-        rel = f"./inbox/{fname}"
-        return f"[用户发来 {msgtype}: {rel} ({len(plain)} bytes)]"
+        return f"./inbox/{fname}"
+
+    async def _save_media_placeholder(
+        self,
+        payload: dict[str, Any],
+        msgtype: str,
+        session_id: str,
+        media_tag: str,
+    ) -> str:
+        """Wrap _save_media_bytes for non-vision media (file/video). Always
+        returns a printable placeholder, never None — failure becomes a
+        ``下载失败`` placeholder so the LLM still sees something."""
+        rel = await self._save_media_bytes(payload, msgtype, session_id, media_tag)
+        if rel is None:
+            return f"[用户发来 {msgtype},但下载失败]"
+        try:
+            cwd = self._workspace_resolver(session_id)
+            size = (cwd / rel.lstrip("./")).stat().st_size
+        except Exception:                                    # noqa: BLE001
+            size = -1
+        size_part = f" ({size} bytes)" if size >= 0 else ""
+        return f"[用户发来 {msgtype}: {rel}{size_part}]"
 
     async def _handle_event_callback(self, frame: dict[str, Any]) -> None:
         body = frame.get("body") or {}

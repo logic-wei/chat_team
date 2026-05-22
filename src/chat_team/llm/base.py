@@ -6,6 +6,8 @@ import abc
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from ..adapters.base import ContentBlock
+
 Role = Literal["system", "user", "assistant", "tool"]
 
 
@@ -19,7 +21,10 @@ class ToolCall:
 @dataclass
 class ChatMessage:
     role: Role
-    content: str = ""
+    # ``str`` for assistant / tool / plain user messages; ``list[ContentBlock]``
+    # for multi-modal user messages (text + image blocks). Provider, compactor,
+    # and persistence all branch on ``isinstance(content, list)``.
+    content: str | list[ContentBlock] = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None  # set when role == "tool"
     name: str | None = None
@@ -40,6 +45,8 @@ class CompletionRequest:
     model: str = ""
     temperature: float = 0.3
     max_tokens: int | None = None
+    image_detail: str | None = None  # "low" | "high" | "auto"; provider applies to every image block
+    image_base_dir: Any | None = None  # base for resolving relative image paths (typically session.cwd)
 
 
 @dataclass

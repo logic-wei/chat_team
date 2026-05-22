@@ -13,6 +13,7 @@ class RoleLLMConfig:
     model: str = ""                      # falls back to settings.llm.default_model
     temperature: float | None = None     # falls back to settings.llm.default_temperature
     history_token_budget: int | None = None
+    image_detail: str | None = None      # "low" | "high" | "auto"; falls back to settings.llm.default_image_detail
 
 
 @dataclass
@@ -39,6 +40,7 @@ class Role:
             model=llm_raw.get("model", ""),
             temperature=llm_raw.get("temperature"),
             history_token_budget=llm_raw.get("history_token_budget"),
+            image_detail=llm_raw.get("image_detail"),
         )
         name = raw.get("name")
         if not name or not isinstance(name, str):

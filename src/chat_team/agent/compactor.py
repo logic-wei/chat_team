@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Iterable
 
 import tiktoken
 
+from ..adapters.base import blocks_to_text
 from ..llm.base import ChatMessage, CompletionRequest, LLMProvider
 
 if TYPE_CHECKING:
@@ -43,7 +44,7 @@ def _enc() -> tiktoken.Encoding | None:
 
 
 def _msg_token_repr(m: ChatMessage) -> str:
-    s = m.content or ""
+    s = blocks_to_text(m.content)
     if m.tool_calls:
         s += json.dumps(
             [{"name": c.name, "args": c.arguments} for c in m.tool_calls],
@@ -80,7 +81,7 @@ def _render_for_summary(messages: list[ChatMessage]) -> str:
         prefix = f"[{m.role}]"
         if m.name:
             prefix += f" ({m.name})"
-        body = (m.content or "").strip()
+        body = blocks_to_text(m.content).strip()
         if body:
             lines.append(f"{prefix} {body}")
         if m.tool_calls:

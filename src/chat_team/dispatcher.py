@@ -40,9 +40,12 @@ class Dispatcher:
 
     async def handle(self, msg: IncomingMessage, stream: StreamHandle) -> None:
         session = self.sessions.get_or_create(msg.session_id)
+        # Prefer rich content_blocks (multi-modal); fall back to flat text for
+        # adapters that haven't been upgraded.
+        user_content = msg.content_blocks if msg.content_blocks else msg.text
         async with session.lock:
             try:
-                final = await self._run_turn(session, msg.text, stream)
+                final = await self._run_turn(session, user_content, stream)
             finally:
                 session.reset_turn_counters()
             await stream.finish(final)
@@ -58,14 +61,17 @@ class Dispatcher:
             self.persistence.schedule(session)
 
     async def _run_turn(
-        self, session: Session, user_text: str, stream: StreamHandle
+        self,
+        session: Session,
+        user_content,
+        stream: StreamHandle,
     ) -> str:
         cap = self.settings.session.per_turn_transfer_cap
         while True:
             agent = self._agent_for(session, session.current_role)
             self._apply_pending_handoff(agent, session)
             try:
-                return await agent.handle(user_text, stream)
+                return await agent.handle(user_content, stream)
             except TransferRequested as t:
                 session.transfer_count_this_turn += 1
                 if session.transfer_count_this_turn >= cap:

@@ -38,6 +38,7 @@ class LLMConfig:
     default_model: str = "gpt-4o-mini"
     default_temperature: float = 0.3
     default_history_token_budget: int = 12000
+    default_image_detail: str = "high"   # "low" | "high" | "auto"; consulted when role doesn't set image_detail
 
 
 @dataclass

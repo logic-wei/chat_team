@@ -16,12 +16,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 os.environ["CHAT_TEAM_HOME"] = "/tmp/chat_team_wecom_smoke"
 shutil.rmtree(os.environ["CHAT_TEAM_HOME"], ignore_errors=True)
 
-from chat_team.adapters.base import ChatType
+from chat_team.adapters.base import ChatType, blocks_to_text, coalesce_text_blocks
 from chat_team.adapters.wecom import (
     WeComBotAdapter,
     WeComStreamHandle,
     _LRU,
     _MENTION_RE,
+    _strip_mention_from_first_text,
 )
 from chat_team.config import load_settings
 
@@ -43,14 +44,20 @@ def test_mention_strip():
 
 async def _parse_full(adapter, frame):
     """Mirror what `_handle_msg_callback` does up to handler dispatch:
-    metadata + async text resolution + group @-mention strip."""
+    metadata + async block resolution (handles quote + group @-strip) + coalesce."""
     body = frame.get("body") or {}
     msgtype = body.get("msgtype") or "text"
     inbound = adapter._parse_metadata(frame)
-    text = await adapter._resolve_inbound_text(body, msgtype, inbound.session_id)
-    if inbound.chat_type == ChatType.GROUP and text:
-        text = _MENTION_RE.sub("", text, count=1).strip()
-    inbound.text = text or ""
+    blocks = await adapter._resolve_inbound_blocks(
+        body, msgtype, inbound.session_id, inbound.chat_type,
+    )
+    if blocks is None:
+        inbound.content_blocks = []
+        inbound.text = ""
+        return inbound
+    blocks = coalesce_text_blocks(blocks)
+    inbound.content_blocks = blocks
+    inbound.text = blocks_to_text(blocks)
     return inbound
 
 
@@ -117,8 +124,8 @@ async def test_parse_inbound_voice():
 
 
 async def test_parse_inbound_image_no_workspace():
-    """No workspace_resolver wired → media save fails gracefully with a
-    placeholder text instead of crashing."""
+    """No workspace_resolver wired → image save fails gracefully and
+    becomes a single ``[图片下载失败]`` text block, never an image block."""
     settings = load_settings()
     adapter = WeComBotAdapter(settings)            # no resolver
     frame = {
@@ -132,7 +139,22 @@ async def test_parse_inbound_image_no_workspace():
     }
     inbound = await _parse_full(adapter, frame)
     assert inbound is not None
-    assert "下载失败" in inbound.text, inbound.text
+    assert inbound.content_blocks == [{"type": "text", "text": "[图片下载失败]"}], inbound.content_blocks
+    assert "下载失败" in inbound.text
+
+
+def test_strip_mention_first_text_block_only():
+    """The strip MUST only touch the leading text block — image blocks
+    before it are preserved, and trailing text blocks are unchanged."""
+    blocks = [
+        {"type": "text", "text": "@小管 看下这张图"},
+        {"type": "image", "path": "./inbox/a.jpg"},
+        {"type": "text", "text": "@小管 followup"},
+    ]
+    out = _strip_mention_from_first_text(blocks)
+    assert out[0] == {"type": "text", "text": "看下这张图"}
+    assert out[1] == {"type": "image", "path": "./inbox/a.jpg"}
+    assert out[2] == {"type": "text", "text": "@小管 followup"}, out[2]
 
 
 def test_dedup():
@@ -171,6 +193,7 @@ async def test_stream_frame_shape():
 async def main():
     test_lru()
     test_mention_strip()
+    test_strip_mention_first_text_block_only()
     await test_parse_inbound_single()
     await test_parse_inbound_group_strips_mention()
     await test_parse_inbound_voice()
