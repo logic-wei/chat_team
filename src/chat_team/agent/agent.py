@@ -37,6 +37,22 @@ log = logging.getLogger(__name__)
 
 MAX_TOOL_LOOPS = 8                         # bound the chat+tool loop per turn
 
+# Injected into a role's system prompt only when the role exposes both `skill`
+# and `run_command`. The combination is a strong signal the agent will be asked
+# to execute Python emitted by skill bodies — community skills can't be modified
+# to declare deps, so we teach the agent a uniform `uv run` + PEP 723 pattern
+# that resolves third-party imports without polluting the host environment.
+PYTHON_UV_CONVENTION = """[Python 执行约定]
+当你需要执行 Python 脚本且引入第三方库时,请使用 PEP 723 inline metadata + `uv run`,不要直接 `pip install` 也不要假设库已安装:
+
+    # /// script
+    # dependencies = ["pkg-a", "pkg-b"]
+    # ///
+    import pkg_a
+    ...
+
+执行: `uv run script.py`。uv 会自动下载并隔离依赖。首次新依赖可能需要 30-60s 下载。"""
+
 
 @dataclass
 class Agent:
@@ -67,6 +83,8 @@ class Agent:
         skills_block = self._render_skills_block()
         if skills_block:
             blocks.append(skills_block)
+        if {"skill", "run_command"}.issubset(set(self.role.tools)):
+            blocks.append(PYTHON_UV_CONVENTION)
         blocks.append("\n".join([
             f"[当前角色] {self.role.name} ({self.role.display_name})",
             f"[团队记事本目录] {toc}",

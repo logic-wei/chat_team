@@ -5,6 +5,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import shutil
 
 from .adapters.base import BotAdapter
 from .agent.tools.base import ToolRegistry
@@ -77,9 +78,27 @@ def build_llm_provider(settings: Settings) -> LLMProvider:
     )
 
 
+def warn_if_uv_missing(roles: RoleRegistry) -> None:
+    """WARN when a Python-capable role is loaded but `uv` isn't on PATH.
+
+    Triggered by the same `{skill, run_command}` combination that injects the
+    PEP 723 convention into the agent's system prompt (see ``agent.py``).
+    Non-fatal: roles that don't run Python skills keep working.
+    """
+    if shutil.which("uv"):
+        return
+    if not any({"skill", "run_command"}.issubset(set(r.tools)) for r in roles.all()):
+        return
+    log.warning(
+        "skill+run_command roles loaded but `uv` not on PATH; "
+        "Python skills will fail. Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    )
+
+
 def build_dispatcher(settings: Settings) -> Dispatcher:
     roles = RoleRegistry.load(settings.paths.user_roles_dir)
     skills = SkillRegistry.load(settings.paths.user_skills_dir)
+    warn_if_uv_missing(roles)
     tools = build_tool_registry(roles, skills)
     sessions = SessionManager(settings)
     llm = build_llm_provider(settings)

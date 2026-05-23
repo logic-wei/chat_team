@@ -75,13 +75,13 @@ def _write_skill(home: Path, name: str, description: str, body: str, aux: dict[s
     return skill_dir
 
 
-def _make_role(name: str, skills: list[str]) -> Role:
+def _make_role(name: str, skills: list[str], tools: list[str] | None = None) -> Role:
     return Role(
         name=name,
         display_name=name,
         description="",
         system_prompt="测试角色",
-        tools=["skill", "skill_read_file"],
+        tools=list(tools) if tools is not None else ["skill", "skill_read_file"],
         skills=list(skills),
         llm=RoleLLMConfig(),
     )
@@ -293,12 +293,90 @@ async def test_compactor_unaffected() -> None:
     print("  ✓ compactor sterile; no skills leakage")
 
 
+async def test_python_uv_convention() -> None:
+    print("== test 6: [Python 执行约定] gated on role having both skill + run_command ==")
+    home, settings = _setup("uv_convention", role_skills=[])
+    _write_skill(home, "pr_review", "给 PR 写 checklist", "正文")
+    skills = SkillRegistry.load(settings.paths.user_skills_dir)
+    sessions = SessionManager(settings)
+
+    def _prompt_for(role: Role, sid: str) -> str:
+        sess = sessions.get_or_create(sid)
+        sess.current_role = role.name
+        agent = Agent(
+            role=role, session=sess, settings=settings,
+            llm=CapturingLLM([]), tools=ToolRegistry(), skills=skills,
+        )
+        return agent._build_system_messages()[0].content or ""
+
+    role_a = _make_role("role_a", ["pr_review"], tools=["skill", "run_command"])
+    body_a = _prompt_for(role_a, "sess-uv-a")
+    assert "[Python 执行约定]" in body_a, "block missing for skill+run_command role"
+    assert "uv run" in body_a and "# /// script" in body_a
+    print("  ✓ skill + run_command → block present")
+
+    role_b = _make_role("role_b", ["pr_review"], tools=["skill", "skill_read_file"])
+    body_b = _prompt_for(role_b, "sess-uv-b")
+    assert "[Python 执行约定]" not in body_b, "block leaked into skill-only role"
+    print("  ✓ skill without run_command → block absent")
+
+    role_c = _make_role("role_c", [], tools=["run_command", "read_file"])
+    body_c = _prompt_for(role_c, "sess-uv-c")
+    assert "[Python 执行约定]" not in body_c, "block leaked into run_command-only role"
+    print("  ✓ run_command without skill → block absent")
+
+
+async def test_uv_missing_warn() -> None:
+    print("== test 7: warn_if_uv_missing fires only when uv absent AND a role needs it ==")
+    import logging
+    from unittest.mock import patch
+
+    from chat_team.app import warn_if_uv_missing
+
+    role_needs = _make_role("needs_python", [], tools=["skill", "run_command"])
+    role_safe = _make_role("text_only", [], tools=["skill", "read_file"])
+
+    handler = logging.Handler()
+    captured: list[logging.LogRecord] = []
+    handler.emit = captured.append   # type: ignore[assignment]
+    logger = logging.getLogger("chat_team.app")
+    logger.addHandler(handler)
+    try:
+        # uv missing + a role that needs it → WARN
+        with patch("chat_team.app.shutil.which", return_value=None):
+            captured.clear()
+            warn_if_uv_missing(RoleRegistry({role_needs.name: role_needs}))
+            warns = [r for r in captured if r.levelno == logging.WARNING]
+            assert warns and "uv" in warns[0].getMessage(), f"missing WARN, got {captured!r}"
+        print("  ✓ uv absent + skill+run_command role → WARN logged")
+
+        # uv missing but no role needs it → silent
+        with patch("chat_team.app.shutil.which", return_value=None):
+            captured.clear()
+            warn_if_uv_missing(RoleRegistry({role_safe.name: role_safe}))
+            warns = [r for r in captured if r.levelno == logging.WARNING]
+            assert not warns, f"unexpected WARN: {[r.getMessage() for r in warns]}"
+        print("  ✓ uv absent but no Python-capable role → silent")
+
+        # uv present → silent regardless
+        with patch("chat_team.app.shutil.which", return_value="/usr/local/bin/uv"):
+            captured.clear()
+            warn_if_uv_missing(RoleRegistry({role_needs.name: role_needs}))
+            warns = [r for r in captured if r.levelno == logging.WARNING]
+            assert not warns, f"unexpected WARN when uv present: {[r.getMessage() for r in warns]}"
+        print("  ✓ uv present → silent")
+    finally:
+        logger.removeHandler(handler)
+
+
 async def main() -> None:
     await test_load_filters_malformed()
     await test_system_prompt_injection()
     await test_skill_tool_run()
     await test_skill_read_file()
     await test_compactor_unaffected()
+    await test_python_uv_convention()
+    await test_uv_missing_warn()
     print("\nALL SKILLS SMOKE TESTS PASSED")
 
 

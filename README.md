@@ -33,6 +33,11 @@ pip install -e .
 只在 `pyproject.toml` 改动 / 增加非 Python 资源 / 重建 venv 时才需要再次 `pip install -e .`;
 普通改源码不需要重装(editable 安装把 `src/chat_team` 软链进了 `site-packages`)。
 
+**可选: 装 `uv`**(`curl -LsSf https://astral.sh/uv/install.sh | sh`)。当某个角色
+同时拥有 `skill` 和 `run_command` 工具时,系统会在它的 prompt 里注入一段 PEP 723 +
+`uv run` 约定;agent 写出来的 Python 脚本可以自动拉第三方依赖,不污染宿主环境。
+没装 `uv` 也能跑,但社区里依赖第三方 Python 库的 skill 就跑不动了 —— 启动时会 WARN。
+
 ## 配置
 
 首次启动会在 `~/.chat_team/` 下生成默认配置:
