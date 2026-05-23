@@ -59,6 +59,29 @@ OPENAI_BASE_URL=https://api.openai.com/v1   # 替换成内部代理 / vLLM / Oll
 
 测试时可用 `CHAT_TEAM_HOME=/tmp/chat_team_dev` 把整个根目录搬走,避免污染真实环境。
 
+### 大模型调用调试日志
+
+排查"工具路由错了 / compactor 摘要变样 / 视觉 OCR 返回奇怪结果"这类问题时,光看
+`chat_team.log` 那点信息往往不够。把 `~/.chat_team/config.yaml` 里的
+`llm.debug_log_enabled` 设成 `true`,每次调 OpenAI 都会把**完整的 request + response**
+落成 JSON 文件:
+
+```
+~/.chat_team/workspaces/<sid>/.chat_team/llm/<时间戳>-<序号>-<角色>-<kind>.json
+```
+
+`kind` 三种:`agent`(角色主轮)/ `compactor`(压缩调用)/ `vision`(图片 OCR shim 和
+`describe_image` 工具)。每条记录包含 `messages` / `tools` / `model` / `temperature` /
+`response` / `finish_reason` / `usage`(token 用量)/ `latency_ms`,失败时多一项
+`error=repr(exc)`、`response=null`。
+
+- **图片 base64 自动脱敏**为 `[redacted: <mime> <字节数> bytes]`,日志可以放心 grep。
+- **默认关闭**——一轮多次调用 + 压缩 + OCR 会快速堆出大量文件,生产**不要打开**,
+  并且 messages 里有用户对话原文,有隐私顾虑。
+- 写入失败只会在 `chat_team.log` 出一条 WARNING,不会影响主流程。
+
+排查完调回 `false` 重启即可。
+
 ### 团队画像 (`team.md`)
 
 `~/.chat_team/team.md` 是自由 markdown 文本,非空时启动会原样读入,在每个虚拟员工
@@ -166,6 +189,7 @@ python scripts/smoke_tools.py                     # 文件 / shell + 沙箱
 python scripts/smoke_wecom_parse.py               # adapter 解析 + LRU + stream 帧形
 python scripts/smoke_compaction_persistence.py    # tiktoken 压缩 + session.json 往返
 python scripts/smoke_media_events.py              # AES-256-CBC + enter_chat / disconnected
+python scripts/smoke_llm_debug_log.py             # 调试日志: image base64 脱敏 + 文件落盘 + per-session seq
 ```
 
 每个 smoke 都把 `CHAT_TEAM_HOME` 指到 `/tmp/...` 并在启动时 `rmtree`,所以反复跑安全。

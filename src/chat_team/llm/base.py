@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from ..adapters.base import ContentBlock
@@ -47,6 +48,14 @@ class CompletionRequest:
     max_tokens: int | None = None
     image_detail: str | None = None  # "low" | "high" | "auto"; provider applies to every image block
     image_base_dir: Any | None = None  # base for resolving relative image paths (typically session.cwd)
+    # Optional debug-log context. When ``debug_log_dir`` is set AND the
+    # provider was constructed with ``debug_log_enabled=True``, the
+    # provider writes one JSON file per call. All four are optional so
+    # legacy/test call sites stay valid.
+    session_id: str | None = None
+    role_name: str | None = None
+    call_kind: str | None = None  # "agent" | "compactor" | "vision"
+    debug_log_dir: Path | None = None
 
 
 @dataclass

@@ -24,6 +24,7 @@ python scripts/smoke_team_profile.py              # team.md injection + compacto
 python scripts/smoke_boss.py                      # CLI boss agent + team_tools
 python scripts/smoke_describe_image.py            # describe_images() cache + DescribeImageTool sandbox
 python scripts/smoke_vision_shim.py               # eager OCR shim (image blocks → text in user content)
+python scripts/smoke_llm_debug_log.py             # per-call LLM debug log: redaction + write + seq
 
 # Conversational team-setup CLI (not the WeCom bot — see "Boss agent" below).
 chat-team-boss
@@ -51,6 +52,7 @@ All persistent state lives under `~/.chat_team/` (override with `CHAT_TEAM_HOME`
       notebook.md          # shared "team whiteboard", ## key blocks, 4KB cap
       notebook.index.json  # updated_at sidecar
       runs/<ts>.log        # full shell stdout (tool returns truncated)
+      llm/<ts>-<seq>-<role>-<kind>.json  # per-LLM-call debug record (when llm.debug_log_enabled)
   logs/                    # rotating chat_team.log
   state/                   # cross-session bits (currently empty, reserved)
 ```
@@ -125,6 +127,8 @@ Key isolation points:
 **Tool sandbox.** `_resolve_under(cwd, rel)` rejects absolute paths and `..`, then double-checks via `os.path.realpath` + `os.path.commonpath`. `list_dir` hides anything starting with `.chat_team` so the LLM doesn't see internal metadata. `run_command` runs through `bash -c` with `cwd=ctx.cwd`, hard timeout from settings, output truncated to `shell_output_max_bytes` (full log to `.chat_team/runs/<ts>-<rand>.log` so the LLM can re-read via `read_file` if needed).
 
 **Team profile injection.** `~/.chat_team/team.md` is read once by `load_settings` into `settings.team_profile` (stripped); when non-empty, `Agent._build_system_messages` splices it as a `[团队信息]` block alongside the role prompt and meta lines. Empty/missing file → no block, behaviour unchanged. The compactor's `_summarize` uses its own sterile system prompt (`compactor.py:100-107`) and is intentionally NOT touched. No hot reload — edits to `team.md` only take effect on the next `chat-team` start.
+
+**LLM debug log.** Opt-in: set `llm.debug_log_enabled: true` in `~/.chat_team/config.yaml` (default off — one file per call piles up fast and transcripts can carry sensitive user content, so production must stay off). When on, every call into `OpenAIChatCompletionProvider.complete` writes a JSON file to `<workspace>/.chat_team/llm/<ts>-<seq>-<role>-<kind>.json`. The record carries the full request payload (messages + tools + model + temperature + max_tokens), the response (content + tool_calls + finish_reason + usage from `completion.usage.model_dump()`), and `latency_ms`. Three `call_kind` values: `agent` (main turn), `compactor` (post-turn summary), `vision` (eager OCR shim + `describe_image` tool). Failures write the same file with `error=repr(exc)` and `response=null` before re-raising. **Base64 image data URIs are redacted** to `[redacted: <mime> <bytes> bytes]` via `chat_team.llm.debug_logger.redact_messages` — files stay grep-able. Per-session monotonic `seq` (process-local dict keyed by `session_id`) keeps filenames sortable when the millisecond clock collides. The provider's `_maybe_write_log` reuses the exact `messages_payload` it built for OpenAI (no re-serialisation), so what you see in the log is what the API saw. Writes are best-effort: a write failure is logged at WARNING and the call still returns normally.
 
 ## Adding a role / tool
 

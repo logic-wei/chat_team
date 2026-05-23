@@ -79,6 +79,7 @@ async def apply_vision_strategy(
     settings: "Settings",
     llm: "LLMProvider",
     cwd: Path,
+    session_id: str | None = None,
 ) -> str | list[ContentBlock]:
     """Apply the role's vision strategy to an inbound user message content.
 
@@ -113,6 +114,9 @@ async def apply_vision_strategy(
         llm=llm,
         model=model,
         image_base_dir=str(cwd),
+        session_id=session_id,
+        role_name=role.name,
+        debug_log_dir=cwd / ".chat_team" / "llm",
     )
     desc_by_index = dict(zip(image_indices, descriptions))
 

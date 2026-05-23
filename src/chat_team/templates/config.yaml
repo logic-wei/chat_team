@@ -28,6 +28,7 @@ llm:
   default_temperature: 0.3
   default_history_token_budget: 12000  # per-role; tighter values trigger compaction sooner
   default_image_detail: high         # vision tile granularity: low | high | auto. high ≈ 1600 tokens / 1024² image — bump history budget if you keep many images in context, or set "low" per-role.
+  debug_log_enabled: false           # write one JSON per LLM call to <workspace>/.chat_team/llm/. base64 image data is redacted. OFF in production — turn on only for local debugging; one file per call piles up fast.
 
 logging:
   max_bytes: 10485760                # 10 MB per log file

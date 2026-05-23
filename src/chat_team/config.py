@@ -53,6 +53,13 @@ class LLMConfig:
     # Prompt used by the eager shim. Empty → fall back to the OCR-with-
     # fallback prompt defined in runtime.vision_shim.DEFAULT_OCR_PROMPT.
     default_eager_prompt: str = ""
+    # When true, every OpenAI provider call writes a JSON file to
+    # <workspace>/.chat_team/llm/ recording the request payload (with
+    # base64 image data URIs redacted), the response, token usage, and
+    # latency. Off by default — turn on per-install for debugging; do
+    # NOT enable in production (one file per call adds up fast and
+    # transcripts can contain sensitive user content).
+    debug_log_enabled: bool = False
 
 
 @dataclass

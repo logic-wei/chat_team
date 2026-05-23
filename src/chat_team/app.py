@@ -62,7 +62,11 @@ def build_llm_provider(settings: Settings) -> LLMProvider:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY missing — set it in ~/.chat_team/.env")
     base_url = os.environ.get("OPENAI_BASE_URL") or None
-    return OpenAIChatCompletionProvider(api_key=api_key, base_url=base_url)
+    return OpenAIChatCompletionProvider(
+        api_key=api_key,
+        base_url=base_url,
+        debug_log_enabled=settings.llm.debug_log_enabled,
+    )
 
 
 def build_dispatcher(settings: Settings) -> Dispatcher:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from ...llm.base import ChatMessage, CompletionRequest, LLMProvider
@@ -59,6 +60,9 @@ async def _describe_one(
     model: str,
     image_base_dir: str,
     cache: ImageDescriptionCache,
+    session_id: str | None = None,
+    role_name: str | None = None,
+    debug_log_dir: Path | None = None,
 ) -> str:
     fail = _read_failure_reason(abs_path)
     if fail is not None:
@@ -79,6 +83,10 @@ async def _describe_one(
         temperature=0.0,
         image_detail=detail,
         image_base_dir=image_base_dir,
+        session_id=session_id,
+        role_name=role_name,
+        call_kind="vision",
+        debug_log_dir=debug_log_dir,
     )
     try:
         resp = await llm.complete(request)
@@ -101,6 +109,9 @@ async def describe_images(
     model: str,
     image_base_dir: str,
     cache: ImageDescriptionCache | None = None,
+    session_id: str | None = None,
+    role_name: str | None = None,
+    debug_log_dir: Path | None = None,
 ) -> list[str]:
     """Describe a batch of images, returning one description per input path
     in the same order. Each image is its own concurrent LLM call so a single
@@ -120,6 +131,9 @@ async def describe_images(
             model=model,
             image_base_dir=image_base_dir,
             cache=cache,
+            session_id=session_id,
+            role_name=role_name,
+            debug_log_dir=debug_log_dir,
         )
         for p in paths
     ]
@@ -193,6 +207,9 @@ class DescribeImageTool(Tool):
             llm=ctx.llm,
             model=model,
             image_base_dir=str(ctx.cwd),
+            session_id=ctx.session.session_id,
+            role_name=ctx.session.current_role,
+            debug_log_dir=ctx.cwd / ".chat_team" / "llm",
         )
         sections = [
             f"[图:{rel}]\n{desc}"

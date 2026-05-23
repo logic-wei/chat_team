@@ -92,7 +92,11 @@ def _render_for_summary(messages: list[ChatMessage]) -> str:
 
 
 async def _summarize(
-    prefix: list[ChatMessage], llm: LLMProvider, model: str
+    prefix: list[ChatMessage],
+    llm: LLMProvider,
+    model: str,
+    *,
+    agent: "Agent",
 ) -> str:
     body = _render_for_summary(prefix)
     request = CompletionRequest(
@@ -110,6 +114,10 @@ async def _summarize(
         ],
         model=model,
         temperature=0.0,
+        session_id=agent.session.session_id,
+        role_name=agent.role.name,
+        call_kind="compactor",
+        debug_log_dir=agent.session.cwd / ".chat_team" / "llm",
     )
     resp = await llm.complete(request)
     return (resp.message.content or "").strip()
@@ -142,7 +150,7 @@ async def maybe_compact(agent: "Agent", llm: LLMProvider) -> bool:
 
     model = agent.role.llm.model or agent.settings.llm.default_model
     try:
-        summary = await _summarize(prefix, llm, model)
+        summary = await _summarize(prefix, llm, model, agent=agent)
     except Exception:                                         # noqa: BLE001
         log.exception("summarize failed for role=%s; leaving history intact", agent.role.name)
         return False

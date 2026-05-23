@@ -82,6 +82,7 @@ class Dispatcher:
                 settings=self.settings,
                 llm=self.llm,
                 cwd=session.cwd,
+                session_id=session.session_id,
             )
             try:
                 return await agent.handle(transformed, stream)

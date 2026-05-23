@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 from openai import AsyncOpenAI
 
 from ..adapters.base import blocks_to_text
+from . import debug_logger
 from .base import (
     ChatMessage,
     CompletionRequest,
@@ -154,17 +156,25 @@ def _to_openai_tools(specs) -> list[dict[str, Any]]:
 
 
 class OpenAIChatCompletionProvider(LLMProvider):
-    def __init__(self, api_key: str, base_url: str | None = None):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str | None = None,
+        *,
+        debug_log_enabled: bool = False,
+    ):
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+        self._debug_log_enabled = debug_log_enabled
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
+        messages_payload = _to_openai_messages(
+            request.messages,
+            image_detail=request.image_detail,
+            image_base_dir=request.image_base_dir,
+        )
         kwargs: dict[str, Any] = {
             "model": request.model,
-            "messages": _to_openai_messages(
-                request.messages,
-                image_detail=request.image_detail,
-                image_base_dir=request.image_base_dir,
-            ),
+            "messages": messages_payload,
             "temperature": request.temperature,
         }
         if request.tools:
@@ -172,7 +182,23 @@ class OpenAIChatCompletionProvider(LLMProvider):
         if request.max_tokens:
             kwargs["max_tokens"] = request.max_tokens
 
-        completion = await self._client.chat.completions.create(**kwargs)
+        t0 = time.monotonic()
+        try:
+            completion = await self._client.chat.completions.create(**kwargs)
+        except Exception as exc:                                  # noqa: BLE001
+            latency_ms = (time.monotonic() - t0) * 1000.0
+            self._maybe_write_log(
+                request,
+                messages_payload=messages_payload,
+                response_message=None,
+                finish_reason=None,
+                usage=None,
+                latency_ms=latency_ms,
+                error=repr(exc),
+            )
+            raise
+
+        latency_ms = (time.monotonic() - t0) * 1000.0
         choice = completion.choices[0]
         msg = choice.message
 
@@ -189,8 +215,55 @@ class OpenAIChatCompletionProvider(LLMProvider):
             content=msg.content or "",
             tool_calls=tool_calls,
         )
+        usage = None
+        if getattr(completion, "usage", None) is not None:
+            try:
+                usage = completion.usage.model_dump()
+            except Exception:                                     # noqa: BLE001
+                usage = None
+        self._maybe_write_log(
+            request,
+            messages_payload=messages_payload,
+            response_message=debug_logger._serialise_response_message(msg),
+            finish_reason=choice.finish_reason,
+            usage=usage,
+            latency_ms=latency_ms,
+            error=None,
+        )
         return CompletionResponse(
             message=chat_msg,
             finish_reason=choice.finish_reason or "stop",
             raw=completion,
+        )
+
+    def _maybe_write_log(
+        self,
+        request: CompletionRequest,
+        *,
+        messages_payload: list[dict[str, Any]],
+        response_message: dict[str, Any] | None,
+        finish_reason: str | None,
+        usage: dict[str, Any] | None,
+        latency_ms: float,
+        error: str | None,
+    ) -> None:
+        if not self._debug_log_enabled:
+            return
+        if request.debug_log_dir is None:
+            return
+        debug_logger.write_call_log(
+            dir_path=request.debug_log_dir,
+            session_id=request.session_id,
+            role_name=request.role_name,
+            call_kind=request.call_kind,
+            model=request.model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            tool_names=[s.name for s in request.tools],
+            messages_payload=messages_payload,
+            response_message=response_message,
+            finish_reason=finish_reason,
+            usage=usage,
+            latency_ms=latency_ms,
+            error=error,
         )

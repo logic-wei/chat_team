@@ -74,6 +74,8 @@ class _FakeNotebook:
 class _FakeSession:
     cwd: Path
     notebook: _FakeNotebook
+    session_id: str = "smoke-sid"
+    current_role: str = "test_role"
 
 
 def _make_image(dir_: Path, name: str) -> Path:

@@ -99,6 +99,10 @@ class Agent:
                 temperature=self._temperature(),
                 image_detail=self._image_detail(),
                 image_base_dir=self.session.cwd,
+                session_id=self.session.session_id,
+                role_name=self.role.name,
+                call_kind="agent",
+                debug_log_dir=self.session.cwd / ".chat_team" / "llm",
             )
             response = await self.llm.complete(request)
             assistant = response.message
