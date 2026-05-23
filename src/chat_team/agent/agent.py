@@ -31,6 +31,7 @@ from .tools.base import (
 
 if TYPE_CHECKING:
     from ..session.session import Session
+    from ..skills.registry import SkillRegistry
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class Agent:
     settings: Settings
     llm: LLMProvider
     tools: ToolRegistry
+    skills: "SkillRegistry | None" = None
     history: list[ChatMessage] = field(default_factory=list)
     pending_system_inject: list[str] = field(default_factory=list)
 
@@ -62,6 +64,9 @@ class Agent:
         blocks: list[str] = [self.role.system_prompt]
         if self.settings.team_profile:
             blocks.append("[团队信息]\n" + self.settings.team_profile)
+        skills_block = self._render_skills_block()
+        if skills_block:
+            blocks.append(skills_block)
         blocks.append("\n".join([
             f"[当前角色] {self.role.name} ({self.role.display_name})",
             f"[团队记事本目录] {toc}",
@@ -77,6 +82,16 @@ class Agent:
     def _all_employee_roster_keys(self) -> list[str]:
         # placeholder for future employee roster; kept to avoid future refactor.
         return []
+
+    def _render_skills_block(self) -> str:
+        if not self.role.skills or self.skills is None:
+            return ""
+        toc = self.skills.render_toc(self.role.skills)
+        if not toc:
+            return ""
+        return (
+            "[可用 skills] (可调用 skill 工具按名加载正文,然后照其指引执行)\n" + toc
+        )
 
     # ---- main loop ---------------------------------------------------------
 

@@ -21,6 +21,7 @@ from .agent.tools.team_tools import (
     DeleteRoleTool,
     ListAvailableToolsTool,
     ListRolesTool,
+    ListSkillsTool,
     ReadRoleTool,
     ReadTeamProfileTool,
     WriteRoleTool,
@@ -61,13 +62,26 @@ BOSS_ROLE = Role(
         "- description: 一句话职责简介,会出现在 transfer_to_employee 的 enum 里。\n"
         "- system_prompt: 角色的人格 + 行为指令(多行字符串)。\n"
         "- tools: 工具名列表 —— **只能使用 list_available_tools 返回的名字**。\n"
-        "- llm.{model, temperature, history_token_budget}: 可选,留空走全局默认。\n"
+        "- skills: 可选,字符串列表,该角色可调用的 skill 白名单 —— **只能使用 list_skills 返回的 name**。\n"
+        "  写了 skills 的角色,**tools 里必须同时含 `skill`**(以及可选的 `skill_read_file`),否则 LLM 调不到。\n"
+        "- llm.{model, temperature, history_token_budget, image_detail, vision_strategy}: 可选,留空走全局默认。\n"
         "- welcome_message: 可选,企微 enter_chat 时发的欢迎语。\n"
         "\n"
         "[配 tools 的经验]\n"
         "- 一个能转交工作的『前台』角色一般要 transfer_to_employee + notebook_read + notebook_write。\n"
         "- 干活的角色按需挑 read_file / write_file / list_dir / run_command;以及通常需要 notebook_read 看团队备忘。\n"
-        "- 不确定就先 list_available_tools 拿一份当前真实可用清单。\n"
+        "- 想让该角色用某些 skill 时:tools 加 `skill`(必需) + 可选 `skill_read_file`(skill 带辅助文件时再加),"
+        "skills 列出具体名字。\n"
+        "- 不确定就先 list_available_tools / list_skills 拿一份当前真实可用清单。\n"
+        "\n"
+        "[skill 是什么]\n"
+        "- skill 是一份 markdown 能力包(~/.chat_team/skills/<name>/SKILL.md),含 YAML frontmatter "
+        "(name + description) + 正文(指令/checklist/规约)。\n"
+        "- 角色在系统提示里会看到 [可用 skills] TOC,需要时调 `skill(name=...)` 拉正文照做;有辅助文件时用 "
+        "`skill_read_file(skill=..., path=...)` 读取。\n"
+        "- 用户提到『某种规约/checklist/做事流程』时,先 list_skills 看是否已经有现成 skill 可白名单进来,"
+        "再考虑写到 system_prompt 里。\n"
+        "- 本期 boss 不直接编辑也不调用 skill,只能 list_skills 摸底;skill 文件由用户在 ~/.chat_team/skills/ 下手工维护。\n"
         "\n"
         "[团队画像 (team.md)]\n"
         "- 自由 markdown,内容会被原样注入,建议 ≤ 300 字。\n"
@@ -85,6 +99,7 @@ BOSS_ROLE = Role(
         "read_team_profile",
         "write_team_profile",
         "list_available_tools",
+        "list_skills",
     ],
     llm=RoleLLMConfig(temperature=0.4, history_token_budget=12000),
     welcome_message=None,
@@ -123,6 +138,7 @@ def build_boss_tool_registry() -> ToolRegistry:
     reg.register(ReadTeamProfileTool())
     reg.register(WriteTeamProfileTool())
     reg.register(ListAvailableToolsTool())
+    reg.register(ListSkillsTool())
     return reg
 
 

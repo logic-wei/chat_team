@@ -25,6 +25,7 @@ python scripts/smoke_boss.py                      # CLI boss agent + team_tools
 python scripts/smoke_describe_image.py            # describe_images() cache + DescribeImageTool sandbox
 python scripts/smoke_vision_shim.py               # eager OCR shim (image blocks → text in user content)
 python scripts/smoke_llm_debug_log.py             # per-call LLM debug log: redaction + write + seq
+python scripts/smoke_skills.py                    # SkillRegistry + skill / skill_read_file tools + system-prompt TOC
 
 # Conversational team-setup CLI (not the WeCom bot — see "Boss agent" below).
 chat-team-boss
@@ -45,6 +46,7 @@ All persistent state lives under `~/.chat_team/` (override with `CHAT_TEAM_HOME`
   .env                     # WECOM_BOT_ID, WECOM_SECRET, OPENAI_API_KEY, OPENAI_BASE_URL
   team.md                  # global team profile; injected into every agent's system prompt
   roles/                   # user-defined role YAMLs override builtins by name
+  skills/                  # user-defined skill dirs (<name>/SKILL.md + aux files) override builtins by name
   workspaces/<sid>/        # one per chat session
     inbox/                 # decrypted inbound media lands here
     .chat_team/
@@ -135,6 +137,8 @@ Key isolation points:
 **Role** — drop a YAML in `src/chat_team/roles/builtin/` (committed) or `~/.chat_team/roles/` (user override, takes precedence). Required fields: `name`, `system_prompt`, `tools` (a subset of registered tool names). Optional: `display_name`, `welcome_message` (used for `enter_chat`), `llm.{model,temperature,history_token_budget,image_detail,vision_strategy}`. `vision_strategy: tool|direct` overrides the global default — set `direct` on a role that needs raw images in context (e.g. art critique). No code changes needed — `RoleRegistry.load` picks it up and `transfer_to_employee`'s enum is rebuilt from `roles.names()`.
 
 **Tool** — subclass `Tool` (`src/chat_team/agent/tools/base.py`), set `name`/`description`/`parameters` (JSON schema), implement `async run(ctx, **kwargs)`. Register in `app.build_tool_registry`. Reference it in role YAMLs that should expose it. Raise `ToolError` for recoverable failures (returned to the LLM as a tool message); raise `TransferRequested` only if you're implementing role-switch semantics. If your tool needs to call the LLM (e.g. vision/embedding), read `ctx.llm` — `ToolContext.llm` is wired to `agent.llm` so the tool reuses the same provider configuration.
+
+**Skill** — a no-code capability pack: drop a directory at `~/.chat_team/skills/<name>/` containing `SKILL.md` (YAML frontmatter + markdown body) plus optional auxiliary files. Frontmatter must have `name` (must equal the directory name) and `description` (single line preferred — multi-line works but only the first line lands in the system-prompt TOC). Body is whatever instructions you want the agent to follow when invoked. To expose a skill to a role, list it under `skills:` in the role YAML AND include `skill` (and optionally `skill_read_file`) in `tools:`. The agent sees a `[可用 skills] - name: description` block in its system prompt, fetches the body via `skill(name=...)`, and reads aux files via `skill_read_file(skill=..., path=...)`. `SkillRegistry.load` mirrors `RoleRegistry.load`: builtin (`src/chat_team/skills/builtin/`) first, user dir overrides by name. Malformed skills (missing/invalid frontmatter, name/dir mismatch, missing SKILL.md) are logged at WARNING and skipped — one bad dir won't break the rest. Per-role gating happens twice: once when rendering the TOC (filtered to `role.skills ∩ registry.names()`) and again at tool invocation in `SkillTool.run`. The `enum` on the JSON-schema parameters is the full registry (one tool instance for all roles), so the runtime check is the real gate. No hot reload — restart `chat-team` after adding/editing skills.
 
 ## Things to not break
 

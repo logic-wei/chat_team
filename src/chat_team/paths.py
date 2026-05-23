@@ -23,6 +23,7 @@ class Paths:
     dotenv: Path
     team_md: Path
     user_roles_dir: Path
+    user_skills_dir: Path
     workspaces_dir: Path
     logs_dir: Path
     state_dir: Path
@@ -59,12 +60,19 @@ def init_home(home: Path | None = None) -> Paths:
         dotenv=root / ".env",
         team_md=root / "team.md",
         user_roles_dir=root / "roles",
+        user_skills_dir=root / "skills",
         workspaces_dir=root / "workspaces",
         logs_dir=root / "logs",
         state_dir=root / "state",
     )
 
-    for d in (paths.user_roles_dir, paths.workspaces_dir, paths.logs_dir, paths.state_dir):
+    for d in (
+        paths.user_roles_dir,
+        paths.user_skills_dir,
+        paths.workspaces_dir,
+        paths.logs_dir,
+        paths.state_dir,
+    ):
         d.mkdir(parents=True, exist_ok=True)
 
     if not paths.config_yaml.exists():

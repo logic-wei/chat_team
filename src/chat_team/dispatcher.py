@@ -17,6 +17,7 @@ from .roles.registry import RoleRegistry
 from .session.manager import SessionManager
 from .session.persistence import PersistenceManager
 from .session.session import PendingHandoff, Session
+from .skills.registry import SkillRegistry
 from .vision_shim import apply_vision_strategy
 
 log = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ class Dispatcher:
         roles: RoleRegistry,
         tools: ToolRegistry,
         llm: LLMProvider,
+        skills: SkillRegistry | None = None,
         persistence: PersistenceManager | None = None,
     ):
         self.settings = settings
@@ -37,6 +39,7 @@ class Dispatcher:
         self.roles = roles
         self.tools = tools
         self.llm = llm
+        self.skills = skills if skills is not None else SkillRegistry({})
         self.persistence = persistence
 
     async def handle(self, msg: IncomingMessage, stream: StreamHandle) -> None:
@@ -142,6 +145,7 @@ class Dispatcher:
             settings=self.settings,
             llm=self.llm,
             tools=self.tools,
+            skills=self.skills,
         )
         # First time we materialise this role for the session — adopt any
         # history loaded from disk and consume it (one-shot).

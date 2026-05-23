@@ -24,6 +24,7 @@ from .agent.tools.notebook_tools import (
     NotebookWriteTool,
 )
 from .agent.tools.shell_tool import RunCommandTool
+from .agent.tools.skill_tools import SkillReadFileTool, SkillTool
 from .agent.tools.transfer_tool import TransferToEmployeeTool
 from .config import Settings, load_settings
 from .dispatcher import Dispatcher
@@ -32,11 +33,15 @@ from .llm.openai_provider import OpenAIChatCompletionProvider
 from .roles.registry import RoleRegistry
 from .session.manager import SessionManager
 from .session.persistence import PersistenceManager
+from .skills.registry import SkillRegistry
 
 log = logging.getLogger(__name__)
 
 
-def build_tool_registry(roles: RoleRegistry) -> ToolRegistry:
+def build_tool_registry(
+    roles: RoleRegistry,
+    skills: SkillRegistry | None = None,
+) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(ReadFileTool())
     reg.register(WriteFileTool())
@@ -52,6 +57,9 @@ def build_tool_registry(roles: RoleRegistry) -> ToolRegistry:
     reg.register(SendFileTool())
     reg.register(DescribeImageTool())
     reg.register(TransferToEmployeeTool(available_employees=roles.names()))
+    if skills is not None and skills.names():
+        reg.register(SkillTool(skills=skills, roles=roles))
+        reg.register(SkillReadFileTool(skills=skills, roles=roles))
     return reg
 
 
@@ -71,11 +79,15 @@ def build_llm_provider(settings: Settings) -> LLMProvider:
 
 def build_dispatcher(settings: Settings) -> Dispatcher:
     roles = RoleRegistry.load(settings.paths.user_roles_dir)
-    tools = build_tool_registry(roles)
+    skills = SkillRegistry.load(settings.paths.user_skills_dir)
+    tools = build_tool_registry(roles, skills)
     sessions = SessionManager(settings)
     llm = build_llm_provider(settings)
     persistence = PersistenceManager(settings)
-    return Dispatcher(settings, sessions, roles, tools, llm, persistence=persistence)
+    return Dispatcher(
+        settings, sessions, roles, tools, llm,
+        skills=skills, persistence=persistence,
+    )
 
 
 def configure_logging(settings: Settings) -> None:

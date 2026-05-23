@@ -282,15 +282,75 @@ def test_boss_not_in_registry() -> None:
 
 
 def test_boss_tool_registry_complete() -> None:
-    print("== test 8: build_boss_tool_registry has all 7 tools ==")
+    print("== test 8: build_boss_tool_registry has all expected tools ==")
     reg = build_boss_tool_registry()
     expected = {
         "list_roles", "read_role", "write_role", "delete_role",
-        "read_team_profile", "write_team_profile", "list_available_tools",
+        "read_team_profile", "write_team_profile",
+        "list_available_tools", "list_skills",
     }
     got = set(reg._tools.keys())  # noqa: SLF001
     assert got == expected, f"tool mismatch: missing={expected - got}, extra={got - expected}"
     print(f"  ✓ {sorted(got)}")
+
+
+async def test_list_skills_and_role_with_skills() -> None:
+    """list_skills surfaces user skills; write_role accepts a skills: whitelist."""
+    print("== test 9: list_skills + write_role with skills whitelist ==")
+    home = _fresh_home("skills")
+    home.mkdir(parents=True, exist_ok=True)
+    os.environ["CHAT_TEAM_HOME"] = str(home)
+    settings = load_settings()
+    ctx = _ctx(settings)
+
+    from chat_team.agent.tools.team_tools import ListSkillsTool
+
+    # Seed two user skills.
+    skill_dir = home / "skills" / "pr_review"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        '---\nname: pr_review\ndescription: "给 PR 写 checklist 式 review"\n---\n\nbody A\n',
+        encoding="utf-8",
+    )
+    skill_dir2 = home / "skills" / "translate_zh"
+    skill_dir2.mkdir(parents=True, exist_ok=True)
+    (skill_dir2 / "SKILL.md").write_text(
+        '---\nname: translate_zh\ndescription: "中英互译规约"\n---\n\nbody B\n',
+        encoding="utf-8",
+    )
+
+    listing = await ListSkillsTool().run(ctx)
+    assert "pr_review" in listing and "[user]" in listing, f"missing pr_review:\n{listing}"
+    assert "translate_zh" in listing
+    assert "中英互译规约" in listing
+    print(f"  ✓ list_skills surfaces both: \n    {listing.replace(chr(10), chr(10)+'    ')}")
+
+    # list_available_tools should now include skill / skill_read_file because
+    # at least one skill is defined.
+    avail = await ListAvailableToolsTool().run(ctx)
+    assert "skill:" in avail or "skill " in avail, f"main 'skill' tool missing in:\n{avail}"
+    assert "skill_read_file" in avail, f"skill_read_file missing in:\n{avail}"
+    print("  ✓ list_available_tools shows skill / skill_read_file when skills exist")
+
+    # write_role with a skills whitelist should round-trip cleanly.
+    yaml_with_skills = (
+        "name: reviewer\n"
+        "display_name: 评审员\n"
+        "system_prompt: |\n"
+        "  你是评审员小评。\n"
+        "tools:\n"
+        "  - read_file\n"
+        "  - skill\n"
+        "  - skill_read_file\n"
+        "skills:\n"
+        "  - pr_review\n"
+    )
+    out = await WriteRoleTool().run(ctx, name="reviewer", yaml_content=yaml_with_skills)
+    print(f"  ✓ write_role with skills: {out}")
+    role = Role.from_yaml(home / "roles" / "reviewer.yaml")
+    assert role.skills == ["pr_review"], f"skills field lost: {role.skills}"
+    assert "skill" in role.tools
+    print("  ✓ Role.from_yaml preserves skills whitelist")
 
 
 async def main() -> None:
@@ -302,6 +362,7 @@ async def main() -> None:
     await test_list_roles_includes_builtin_and_user()
     test_boss_not_in_registry()
     test_boss_tool_registry_complete()
+    await test_list_skills_and_role_with_skills()
     print("\nALL BOSS SMOKE TESTS PASSED")
 
 

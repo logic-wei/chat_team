@@ -28,6 +28,7 @@ class Role:
     description: str
     system_prompt: str
     tools: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
     llm: RoleLLMConfig = field(default_factory=RoleLLMConfig)
     welcome_message: str | None = None   # used for enter_chat events
 
@@ -51,12 +52,16 @@ class Role:
         name = raw.get("name")
         if not name or not isinstance(name, str):
             raise ValueError("role yaml missing required 'name'")
+        skills_raw = raw.get("skills") or []
+        if not isinstance(skills_raw, list) or not all(isinstance(s, str) for s in skills_raw):
+            raise ValueError("role yaml 'skills' must be a list of strings")
         return cls(
             name=name,
             display_name=raw.get("display_name", name),
             description=raw.get("description", ""),
             system_prompt=raw.get("system_prompt", "").strip(),
             tools=list(raw.get("tools") or []),
+            skills=list(skills_raw),
             llm=llm,
             welcome_message=raw.get("welcome_message"),
         )

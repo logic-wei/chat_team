@@ -17,6 +17,8 @@ import yaml
 
 from ...roles.config import Role
 from ...roles.registry import BUILTIN_DIR
+from ...skills.config import Skill
+from ...skills.registry import BUILTIN_DIR as SKILL_BUILTIN_DIR
 from .base import Tool, ToolContext, ToolError
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -240,11 +242,79 @@ class ListAvailableToolsTool(Tool):
     async def run(self, ctx: ToolContext, **kwargs: Any) -> str:
         # Build a fresh main-runtime tool registry to enumerate names. Use an
         # empty RoleRegistry so the transfer enum has no dependency on real roles.
+        # Pass the live SkillRegistry so skill / skill_read_file appear when
+        # the user has at least one skill defined — otherwise the boss would
+        # tell the user `tools: [skill]` isn't valid.
         from ...app import build_tool_registry            # local import: avoid cycle
         from ...roles.registry import RoleRegistry
+        from ...skills.registry import SkillRegistry
 
-        reg = build_tool_registry(RoleRegistry({}))
+        skills = SkillRegistry.load(ctx.settings.paths.user_skills_dir)
+        reg = build_tool_registry(RoleRegistry({}), skills)
         specs = sorted(reg.specs_for(list(reg._tools.keys())), key=lambda s: s.name)  # noqa: SLF001
         if not specs:
             return "(no tools registered)"
         return "\n".join(f"- {s.name}: {s.description}" for s in specs)
+
+
+def _builtin_skill_names() -> set[str]:
+    if not SKILL_BUILTIN_DIR.exists():
+        return set()
+    return {p.name for p in SKILL_BUILTIN_DIR.iterdir() if p.is_dir() and (p / "SKILL.md").exists()}
+
+
+class ListSkillsTool(Tool):
+    name = "list_skills"
+    description = (
+        "列出当前可用的 skill(builtin + 用户自定义),含 name/description/source。"
+        "用户在 role YAML 的 skills 字段里引用 skill 时,只能用这里返回的 name。"
+        "skill 是『不写代码就能扩展能力』的 markdown 能力包,放在 ~/.chat_team/skills/<name>/SKILL.md。"
+    )
+    parameters = {"type": "object", "properties": {}}
+
+    async def run(self, ctx: ToolContext, **kwargs: Any) -> str:
+        user_dir = ctx.settings.paths.user_skills_dir
+        builtin_names = _builtin_skill_names()
+        seen: dict[str, dict[str, Any]] = {}
+        if SKILL_BUILTIN_DIR.exists():
+            for child in sorted(SKILL_BUILTIN_DIR.iterdir()):
+                if not child.is_dir():
+                    continue
+                try:
+                    sk = Skill.from_dir(child)
+                except ValueError:
+                    continue
+                seen[sk.name] = {
+                    "name": sk.name,
+                    "description": sk.description,
+                    "source": "builtin",
+                }
+        if user_dir.exists():
+            for child in sorted(user_dir.iterdir()):
+                if not child.is_dir() or child.name.startswith("."):
+                    continue
+                try:
+                    sk = Skill.from_dir(child)
+                except ValueError as exc:
+                    seen[child.name] = {
+                        "name": child.name,
+                        "description": f"(加载失败: {exc})",
+                        "source": "user_broken",
+                    }
+                    continue
+                seen[sk.name] = {
+                    "name": sk.name,
+                    "description": sk.description,
+                    "source": "user_override" if sk.name in builtin_names else "user",
+                }
+        if not seen:
+            return (
+                "(暂无 skill)\n"
+                "提示:skill 是 ~/.chat_team/skills/<name>/SKILL.md(YAML frontmatter 必含 name+description)。"
+                "本期 boss 不直接编辑 skill 文件;请用户手工创建或后续版本支持。"
+            )
+        lines = []
+        for entry in sorted(seen.values(), key=lambda e: e["name"]):
+            first_line = entry["description"].split("\n", 1)[0].strip()
+            lines.append(f"- {entry['name']} [{entry['source']}]: {first_line}")
+        return "\n".join(lines)
