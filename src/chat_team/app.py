@@ -8,6 +8,7 @@ import os
 
 from .adapters.base import BotAdapter
 from .agent.tools.base import ToolRegistry
+from .agent.tools.describe_image import DescribeImageTool
 from .agent.tools.file_tools import (
     EditFileTool,
     GlobTool,
@@ -49,6 +50,7 @@ def build_tool_registry(roles: RoleRegistry) -> ToolRegistry:
     reg.register(NotebookDeleteTool())
     reg.register(SendImageTool())
     reg.register(SendFileTool())
+    reg.register(DescribeImageTool())
     reg.register(TransferToEmployeeTool(available_employees=roles.names()))
     return reg
 

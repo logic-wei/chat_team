@@ -16,6 +16,7 @@ from ...llm.base import ToolSpec
 if TYPE_CHECKING:                       # avoid circular imports at runtime
     from ...adapters.base import StreamHandle
     from ...config import Settings
+    from ...llm.base import LLMProvider
     from ...session.session import Session
 
 
@@ -42,6 +43,10 @@ class ToolContext:
     session: "Session"
     settings: "Settings"
     stream: "StreamHandle | None" = None
+    # ``llm`` is None only in test contexts that mock the registry directly;
+    # all production tool invocations carry the agent's provider so tools that
+    # need vision/text completion (e.g. describe_image) can run.
+    llm: "LLMProvider | None" = None
 
 
 class Tool(abc.ABC):

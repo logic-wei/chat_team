@@ -13,6 +13,7 @@ system_prompt: |
 tools:
   - notebook_read
   - notebook_write
+  - describe_image
   - transfer_to_employee
 
 llm:

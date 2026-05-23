@@ -21,6 +21,7 @@ tools:
   - notebook_write
   - send_image
   - send_file
+  - describe_image
   - transfer_to_employee
 
 llm:

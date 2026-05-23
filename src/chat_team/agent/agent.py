@@ -146,6 +146,7 @@ class Agent:
             session=self.session,
             settings=self.settings,
             stream=stream,
+            llm=self.llm,
         )
         return await tool.run(ctx, **(call.arguments or {}))
 

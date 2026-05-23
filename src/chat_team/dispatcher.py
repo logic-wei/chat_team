@@ -17,6 +17,7 @@ from .roles.registry import RoleRegistry
 from .session.manager import SessionManager
 from .session.persistence import PersistenceManager
 from .session.session import PendingHandoff, Session
+from .vision_shim import apply_vision_strategy
 
 log = logging.getLogger(__name__)
 
@@ -67,11 +68,23 @@ class Dispatcher:
         stream: StreamHandle,
     ) -> str:
         cap = self.settings.session.per_turn_transfer_cap
+        original_content = user_content
         while True:
             agent = self._agent_for(session, session.current_role)
             self._apply_pending_handoff(agent, session)
+            # Apply the *current* role's vision strategy to the *original*
+            # user content. On transfer, the new role re-evaluates the same
+            # raw image blocks under its own strategy (and shares the eager
+            # description cache, so re-OCR is essentially free).
+            transformed = await apply_vision_strategy(
+                original_content,
+                role=agent.role,
+                settings=self.settings,
+                llm=self.llm,
+                cwd=session.cwd,
+            )
             try:
-                return await agent.handle(user_content, stream)
+                return await agent.handle(transformed, stream)
             except TransferRequested as t:
                 session.transfer_count_this_turn += 1
                 if session.transfer_count_this_turn >= cap:

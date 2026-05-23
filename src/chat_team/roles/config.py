@@ -14,6 +14,11 @@ class RoleLLMConfig:
     temperature: float | None = None     # falls back to settings.llm.default_temperature
     history_token_budget: int | None = None
     image_detail: str | None = None      # "low" | "high" | "auto"; falls back to settings.llm.default_image_detail
+    # "tool" → eager OCR shim flattens images to text before the agent sees them
+    # (default; cheaper, better compactor accuracy). "direct" → pass image
+    # blocks straight to the provider (high-fidelity multi-turn visual chat).
+    # None → fall back to settings.llm.default_vision_strategy.
+    vision_strategy: str | None = None
 
 
 @dataclass
@@ -41,6 +46,7 @@ class Role:
             temperature=llm_raw.get("temperature"),
             history_token_budget=llm_raw.get("history_token_budget"),
             image_detail=llm_raw.get("image_detail"),
+            vision_strategy=llm_raw.get("vision_strategy"),
         )
         name = raw.get("name")
         if not name or not isinstance(name, str):
