@@ -17,6 +17,11 @@ class SessionConfig:
     msgid_lru_size: int = 500
     persistence_debounce_seconds: float = 10.0
     per_turn_transfer_cap: int = 3
+    # Hard cap on Sessions held in memory. When exceeded, the LRU entry is
+    # flushed to session.json and evicted; the user transparently reloads
+    # from disk on next message. Without this, every distinct user × bot
+    # leaks a Session forever.
+    max_in_memory_sessions: int = 1000
 
 
 @dataclass
@@ -30,6 +35,23 @@ class ToolsConfig:
     file_write_max_bytes: int = 1_048_576
     shell_timeout_seconds: int = 30
     shell_output_max_bytes: int = 8192
+    # Extra env-var names dropped from the run_command subprocess on top of
+    # the built-in deny-list (OPENAI_*, WECOM_*, ANTHROPIC_*, CHAT_TEAM_*,
+    # plus anything containing KEY/SECRET/TOKEN/PASSWORD/CREDENTIAL).
+    shell_env_extra_drop: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CleanupConfig:
+    # Files older than this in inbox/, .chat_team/runs/, .chat_team/llm/
+    # are unlinked on the lazy per-session sweep.
+    max_age_days: int = 14
+    # Minimum gap between two sweeps of the same session. Sweep is triggered
+    # by get_or_create; this throttles thrash on chatty sessions.
+    sweep_interval_hours: float = 6.0
+    sweep_subdirs: list[str] = field(
+        default_factory=lambda: ["inbox", ".chat_team/runs", ".chat_team/llm"]
+    )
 
 
 @dataclass
@@ -64,6 +86,14 @@ class LLMConfig:
     # client waits forever, and since the dispatcher holds session.lock for
     # the duration of a turn a hung request deadlocks the whole session.
     request_timeout_seconds: float = 60.0
+    # Total attempts (including the first) for a single LLM call. Retry is
+    # triggered only by transient errors: RateLimitError, APITimeoutError,
+    # APIConnectionError, InternalServerError. 4xx other than 429 still raises
+    # immediately.
+    max_retries: int = 3
+    # Base delay before the second attempt; doubled each retry with up to
+    # 0.5s of random jitter on top to avoid thundering-herd reconnects.
+    retry_initial_delay: float = 1.0
 
 
 @dataclass
@@ -83,6 +113,7 @@ class Settings:
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     team_profile: str = ""
     env: dict[str, str] = field(default_factory=dict)
 
@@ -127,6 +158,8 @@ def load_settings(paths: Paths | None = None) -> Settings:
         _coerce(settings.llm, raw["llm"])
     if isinstance(raw.get("logging"), dict):
         _coerce(settings.logging, raw["logging"])
+    if isinstance(raw.get("cleanup"), dict):
+        _coerce(settings.cleanup, raw["cleanup"])
 
     settings.env = {
         k: v for k, v in os.environ.items()

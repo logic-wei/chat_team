@@ -5,8 +5,10 @@
 * Stdout+stderr captured; returned to LLM truncated; full transcript saved
   under ``<cwd>/.chat_team/runs/<ts>.log`` so the agent can re-read it via
   ``read_file`` if needed.
-* No environment scrubbing for now — the operator is trusted; tighten in a
-  later stage if the bot ever runs untrusted prompts.
+* Subprocess env is scrubbed via :func:`_scrub_env` — secrets like
+  ``OPENAI_API_KEY`` / ``WECOM_SECRET`` never reach the child, so a
+  prompt-injection that talks the LLM into running ``printenv | curl …``
+  has nothing to leak.
 """
 from __future__ import annotations
 
@@ -15,9 +17,40 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .base import Tool, ToolContext, ToolError
+
+
+_DENY_PREFIXES = ("OPENAI_", "WECOM_", "ANTHROPIC_", "CHAT_TEAM_")
+_DENY_SUBSTRINGS = ("KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL")
+
+
+def _scrub_env(
+    source: dict[str, str] | os._Environ[str],
+    extra_drop: Iterable[str] = (),
+) -> dict[str, str]:
+    """Filter out env vars likely to carry secrets before exec'ing a child.
+
+    Drops anything matching a built-in prefix (``OPENAI_*``, ``WECOM_*``,
+    ``ANTHROPIC_*``, ``CHAT_TEAM_*``), anything whose name contains a
+    sensitive substring (``KEY`` / ``SECRET`` / ``TOKEN`` / ``PASSWORD``
+    / ``CREDENTIAL``, case-insensitive), and any name in ``extra_drop``.
+    Everything else (PATH, HOME, LANG, PROXY, …) is passed through so
+    user scripts keep working.
+    """
+    drop_set = set(extra_drop)
+    out: dict[str, str] = {}
+    for k, v in source.items():
+        if k in drop_set:
+            continue
+        if any(k.startswith(p) for p in _DENY_PREFIXES):
+            continue
+        upper = k.upper()
+        if any(s in upper for s in _DENY_SUBSTRINGS):
+            continue
+        out[k] = v
+    return out
 
 
 def _truncate(text: str, max_bytes: int) -> tuple[str, bool]:
@@ -92,12 +125,16 @@ class RunCommandTool(Tool):
         # `bash -c "sleep 1000 &"` style children share the pgid and can be
         # killed together on timeout. Without this, proc.kill() only kills
         # bash and orphans the children to the init reaper.
+        scrubbed_env = _scrub_env(
+            os.environ, ctx.settings.tools.shell_env_extra_drop,
+        )
         proc = await asyncio.create_subprocess_shell(
             command,
             cwd=str(ctx.cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
+            env=scrubbed_env,
         )
         try:
             stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)

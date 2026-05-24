@@ -265,8 +265,11 @@ async def test_event_flow():
     assert body["text"]["content"]
     print("  welcome payload:", body["text"]["content"][:40], "...")
 
-    # disconnected event sets stop flag
-    assert not adapter._stop.is_set()
+    # disconnected event flags the current connection dead (for reconnect)
+    # but does NOT trigger process shutdown — run_forever recreates the
+    # connection. _shutdown is reserved for explicit close() / SIGINT.
+    assert not adapter._connection_dead.is_set()
+    assert not adapter._shutdown.is_set()
     disc_frame = {
         "cmd": "aibot_event_callback", "headers": {"req_id": "ev2"},
         "body": {
@@ -275,8 +278,9 @@ async def test_event_flow():
         },
     }
     await adapter._handle_event_callback(disc_frame)
-    assert adapter._stop.is_set()
-    print("  ✓ disconnected_event raised stop flag")
+    assert adapter._connection_dead.is_set()
+    assert not adapter._shutdown.is_set()
+    print("  ✓ disconnected_event flagged connection-dead but not shutdown")
 
 
 async def test_welcome_matches_persisted_current_role():

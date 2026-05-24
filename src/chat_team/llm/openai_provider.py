@@ -1,13 +1,22 @@
 """OpenAI Chat Completion provider."""
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
+import random
 import time
 from pathlib import Path
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    InternalServerError,
+    RateLimitError,
+)
 
 from ..adapters.base import blocks_to_text
 from . import debug_logger
@@ -19,6 +28,15 @@ from .base import (
     ToolCall,
 )
 from .image_cache import ImageDataURICache, default_cache
+
+log = logging.getLogger(__name__)
+
+_RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    APITimeoutError,
+    APIConnectionError,
+    RateLimitError,
+    InternalServerError,
+)
 
 
 def _content_as_string(content: Any) -> str:
@@ -163,15 +181,22 @@ class OpenAIChatCompletionProvider(LLMProvider):
         *,
         debug_log_enabled: bool = False,
         request_timeout_seconds: float = 60.0,
+        max_retries: int = 3,
+        retry_initial_delay: float = 1.0,
     ):
         # Pass timeout into the SDK client so a hung request can't hold the
         # session lock indefinitely (the dispatcher holds it for the whole turn).
+        # max_retries=0 disables the SDK's own retry layer so our outer loop
+        # is the single source of truth for retry policy.
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url or None,
             timeout=request_timeout_seconds,
+            max_retries=0,
         )
         self._debug_log_enabled = debug_log_enabled
+        self._max_retries = max(1, int(max_retries))
+        self._retry_initial_delay = max(0.0, float(retry_initial_delay))
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         messages_payload = _to_openai_messages(
@@ -190,9 +215,30 @@ class OpenAIChatCompletionProvider(LLMProvider):
             kwargs["max_tokens"] = request.max_tokens
 
         t0 = time.monotonic()
-        try:
-            completion = await self._client.chat.completions.create(**kwargs)
-        except Exception as exc:                                  # noqa: BLE001
+        attempts = 0
+        completion = None
+        last_exc: Exception | None = None
+        for attempt in range(self._max_retries):
+            attempts = attempt + 1
+            try:
+                completion = await self._client.chat.completions.create(**kwargs)
+                break
+            except _RETRYABLE_EXCEPTIONS as exc:
+                last_exc = exc
+                if attempt >= self._max_retries - 1:
+                    break
+                delay = self._retry_initial_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                log.warning(
+                    "LLM call failed (%s) on attempt %d/%d; retrying in %.2fs",
+                    type(exc).__name__, attempts, self._max_retries, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            except Exception as exc:                              # noqa: BLE001
+                last_exc = exc
+                break
+
+        if completion is None:
             latency_ms = (time.monotonic() - t0) * 1000.0
             self._maybe_write_log(
                 request,
@@ -201,9 +247,11 @@ class OpenAIChatCompletionProvider(LLMProvider):
                 finish_reason=None,
                 usage=None,
                 latency_ms=latency_ms,
-                error=repr(exc),
+                error=repr(last_exc) if last_exc else "unknown",
+                attempts=attempts,
             )
-            raise
+            assert last_exc is not None
+            raise last_exc
 
         latency_ms = (time.monotonic() - t0) * 1000.0
         choice = completion.choices[0]
@@ -236,6 +284,7 @@ class OpenAIChatCompletionProvider(LLMProvider):
             usage=usage,
             latency_ms=latency_ms,
             error=None,
+            attempts=attempts,
         )
         return CompletionResponse(
             message=chat_msg,
@@ -253,6 +302,7 @@ class OpenAIChatCompletionProvider(LLMProvider):
         usage: dict[str, Any] | None,
         latency_ms: float,
         error: str | None,
+        attempts: int = 1,
     ) -> None:
         if not self._debug_log_enabled:
             return
@@ -273,4 +323,5 @@ class OpenAIChatCompletionProvider(LLMProvider):
             usage=usage,
             latency_ms=latency_ms,
             error=error,
+            attempts=attempts,
         )

@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import math
+import random
 import re
 import time
 import uuid
@@ -50,6 +51,11 @@ WECOM_WS_URL = "wss://openws.work.weixin.qq.com"
 HEARTBEAT_INTERVAL = 30
 STREAM_PUSH_MIN_INTERVAL = 1.0          # seconds between intermediate stream frames
 WRITE_QUEUE_MAXSIZE = 1024
+
+# Reconnect backoff: 1s, 2s, 4s, … capped at 5 min; +0.5s jitter per attempt.
+RECONNECT_INITIAL_DELAY = 1.0
+RECONNECT_MAX_DELAY = 300.0
+RECONNECT_JITTER_CAP = 0.5
 
 UPLOAD_CHUNK_SIZE = 256 * 1024          # raw bytes per chunk; ~341KB base64, under 512KB cap
 UPLOAD_RESPONSE_TIMEOUT = 30.0          # per-step ack timeout
@@ -158,7 +164,7 @@ class WeComStreamHandle:
         await self._send_media(path, kind="file", filename=filename)
 
     async def _send_media(self, path: Path, *, kind: str, filename: str | None) -> None:
-        data = path.read_bytes()
+        data = await asyncio.to_thread(path.read_bytes)
         name = filename or path.name
         media_id = await self._adapter.upload_media(data, kind=kind, filename=name)
         payload = {
@@ -179,12 +185,22 @@ class WeComBotAdapter(BotAdapter):
         self.bot_id = settings.get_env("WECOM_BOT_ID") or ""
         self.secret = settings.get_env("WECOM_SECRET") or ""
         self._handler: MessageHandler | None = None
+        # Per-adapter (lifetime) state ----------------------------------
+        # ``_msgid_lru`` survives across reconnects so server-side replays
+        # are still deduped.
+        self._msgid_lru = _LRU(settings.session.msgid_lru_size)
+        self._workspace_resolver = workspace_resolver
+        # ``_shutdown`` is set only by close()/SIGINT; signals the outer
+        # run_forever loop to exit.
+        self._shutdown = asyncio.Event()
+        # Per-connection state (rebuilt each connect iteration) ---------
         self._ws: Any = None
         self._write_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(WRITE_QUEUE_MAXSIZE)
-        self._msgid_lru = _LRU(settings.session.msgid_lru_size)
         self._tasks: list[asyncio.Task] = []
-        self._stop = asyncio.Event()
-        self._workspace_resolver = workspace_resolver
+        # ``_connection_dead`` flips when the current connection ends for
+        # any reason (server close, disconnected_event, write error, …).
+        # Recreated per connection so a fresh wait() resolves correctly.
+        self._connection_dead = asyncio.Event()
         self._pending_acks: dict[str, asyncio.Future] = {}
 
     # ---- BotAdapter interface ---------------------------------------------
@@ -193,6 +209,12 @@ class WeComBotAdapter(BotAdapter):
         self._handler = handler
 
     async def connect(self) -> None:
+        """Open one WS connection and subscribe.
+
+        Kept for backward-compat with code/tests that drive ``connect()`` +
+        ``run()`` directly. In production use ``run_forever()`` instead,
+        which handles transient connection loss with exponential backoff.
+        """
         if not self.bot_id or not self.secret:
             raise RuntimeError("WECOM_BOT_ID / WECOM_SECRET missing in ~/.chat_team/.env")
         log.info("connecting to %s", WECOM_WS_URL)
@@ -208,6 +230,7 @@ class WeComBotAdapter(BotAdapter):
         await self._subscribe()
 
     async def run(self) -> None:
+        """Run one connection until it dies. Use ``run_forever`` in prod."""
         if self._ws is None:
             raise RuntimeError("call connect() before run()")
         self._tasks = [
@@ -216,18 +239,96 @@ class WeComBotAdapter(BotAdapter):
             asyncio.create_task(self._reader_loop(), name="wecom-reader"),
         ]
         try:
-            await self._stop.wait()
+            await self._connection_dead.wait()
         finally:
-            for t in self._tasks:
-                t.cancel()
-            for t in self._tasks:
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
+            await self._tear_down_connection()
+
+    async def run_forever(self) -> None:
+        """Production entry point: keep reconnecting until ``close()``.
+
+        On any non-shutdown disconnect, sleeps with exponential backoff
+        (1s, 2s, 4s, …, capped at 5 min plus jitter) then reconnects.
+        Backoff resets to 1s after a connection that survived long enough
+        to subscribe successfully.
+        """
+        backoff = RECONNECT_INITIAL_DELAY
+        while not self._shutdown.is_set():
+            try:
+                await self._open_connection()
+                # Subscribe succeeded; future disconnects are "transient".
+                backoff = RECONNECT_INITIAL_DELAY
+                await self._serve_one_connection()
+            except Exception as exc:                             # noqa: BLE001
+                log.warning("ws connection ended: %r", exc)
+            finally:
+                await self._tear_down_connection()
+            if self._shutdown.is_set():
+                break
+            sleep_for = backoff + random.uniform(0, RECONNECT_JITTER_CAP)
+            log.info("reconnecting in %.2fs", sleep_for)
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=sleep_for)
+                break                                            # shutdown won the race
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, RECONNECT_MAX_DELAY)
 
     async def close(self) -> None:
-        self._stop.set()
+        self._shutdown.set()
+        self._connection_dead.set()
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:                                # noqa: BLE001
+                pass
+            self._ws = None
+
+    # ---- connection lifecycle --------------------------------------------
+
+    async def _open_connection(self) -> None:
+        """Reset per-connection state, open socket, subscribe."""
+        if not self.bot_id or not self.secret:
+            raise RuntimeError("WECOM_BOT_ID / WECOM_SECRET missing in ~/.chat_team/.env")
+        self._connection_dead = asyncio.Event()
+        self._write_queue = asyncio.Queue(WRITE_QUEUE_MAXSIZE)
+        self._pending_acks = {}
+        log.info("connecting to %s", WECOM_WS_URL)
+        self._ws = await websockets.connect(
+            WECOM_WS_URL,
+            max_size=8 * 1024 * 1024,
+            ping_interval=None,
+            ping_timeout=None,
+        )
+        await self._subscribe()
+
+    async def _serve_one_connection(self) -> None:
+        """Start the 3 cooperating tasks and wait for the connection to die."""
+        self._tasks = [
+            asyncio.create_task(self._writer_loop(), name="wecom-writer"),
+            asyncio.create_task(self._heartbeat_loop(), name="wecom-heartbeat"),
+            asyncio.create_task(self._reader_loop(), name="wecom-reader"),
+        ]
+        await self._connection_dead.wait()
+
+    async def _tear_down_connection(self) -> None:
+        """Cancel per-connection tasks, fail any in-flight ack futures, drop
+        the websocket. Safe to call multiple times (idempotent)."""
+        for t in self._tasks:
+            t.cancel()
+        for t in self._tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):      # noqa: BLE001
+                pass
+        self._tasks = []
+        # Any caller blocked on _send_and_await must wake up with an error
+        # rather than hang forever once the socket is gone.
+        for req_id, fut in list(self._pending_acks.items()):
+            if not fut.done():
+                fut.set_exception(
+                    ConnectionResetError(f"connection lost; req_id={req_id}")
+                )
+        self._pending_acks = {}
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -260,8 +361,8 @@ class WeComBotAdapter(BotAdapter):
             try:
                 await self._ws.send(json.dumps(payload, ensure_ascii=False))
             except Exception:                                # noqa: BLE001
-                log.exception("ws write failed")
-                self._stop.set()
+                log.warning("ws write failed; signalling reconnect", exc_info=True)
+                self._connection_dead.set()
                 return
 
     async def _heartbeat_loop(self) -> None:
@@ -289,7 +390,9 @@ class WeComBotAdapter(BotAdapter):
         except websockets.ConnectionClosed as err:
             log.warning("ws closed: %s", err)
         finally:
-            self._stop.set()
+            # Always flag the connection dead so run_forever can reconnect
+            # (or run() can return cleanly). _shutdown is unaffected.
+            self._connection_dead.set()
 
     async def _enqueue_write(self, payload: dict[str, Any]) -> None:
         await self._write_queue.put(payload)
@@ -599,7 +702,7 @@ class WeComBotAdapter(BotAdapter):
         ts = time.strftime("%Y%m%d-%H%M%S")
         fname = f"{ts}-{safe_tag}.{ext}"
         out = inbox / fname
-        out.write_bytes(plain)
+        await asyncio.to_thread(out.write_bytes, plain)
         return f"./inbox/{fname}"
 
     async def _save_media_placeholder(
@@ -634,8 +737,8 @@ class WeComBotAdapter(BotAdapter):
             session_id = self._session_id_from_body(body)
             await self._reply_welcome(headers.get("req_id"), session_id)
         elif event == "disconnected_event":
-            log.warning("received disconnected_event; closing")
-            self._stop.set()
+            log.warning("received disconnected_event; will reconnect")
+            self._connection_dead.set()
         else:
             log.info("event ignored: %s", event)
 

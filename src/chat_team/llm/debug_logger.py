@@ -135,6 +135,7 @@ def write_call_log(
     usage: dict[str, Any] | None,
     latency_ms: float,
     error: str | None,
+    attempts: int = 1,
 ) -> Path | None:
     """Write one JSON file describing a single LLM call. Returns the
     path written, or ``None`` if the write failed (the call itself
@@ -165,6 +166,7 @@ def write_call_log(
             "usage": usage,
             "latency_ms": round(latency_ms, 3),
             "error": error,
+            "attempts": attempts,
         }
         path.write_text(
             json.dumps(record, ensure_ascii=False, indent=2, default=str),

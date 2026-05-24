@@ -76,6 +76,8 @@ def build_llm_provider(settings: Settings) -> LLMProvider:
         base_url=base_url,
         debug_log_enabled=settings.llm.debug_log_enabled,
         request_timeout_seconds=settings.llm.request_timeout_seconds,
+        max_retries=settings.llm.max_retries,
+        retry_initial_delay=settings.llm.retry_initial_delay,
     )
 
 
@@ -101,9 +103,9 @@ def build_dispatcher(settings: Settings) -> Dispatcher:
     skills = SkillRegistry.load(settings.paths.user_skills_dir)
     warn_if_uv_missing(roles)
     tools = build_tool_registry(roles, skills)
-    sessions = SessionManager(settings)
-    llm = build_llm_provider(settings)
     persistence = PersistenceManager(settings)
+    sessions = SessionManager(settings, persistence=persistence)
+    llm = build_llm_provider(settings)
     return Dispatcher(
         settings, sessions, roles, tools, llm,
         skills=skills, persistence=persistence,
@@ -134,9 +136,15 @@ async def _async_main(adapter_factory) -> None:
     dispatcher = build_dispatcher(settings)
     adapter: BotAdapter = adapter_factory(settings, dispatcher.sessions.workspace_for)
     adapter.set_handler(dispatcher.handle)
-    await adapter.connect()
     try:
-        await adapter.run()
+        # Prefer run_forever (handles transient WS loss); fall back to the
+        # one-shot connect+run for adapters that don't implement it.
+        runner = getattr(adapter, "run_forever", None)
+        if runner is not None:
+            await runner()
+        else:
+            await adapter.connect()
+            await adapter.run()
     finally:
         await adapter.close()
         if dispatcher.persistence is not None:
