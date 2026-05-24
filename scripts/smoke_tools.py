@@ -30,7 +30,7 @@ from chat_team.session.manager import SessionManager
 async def main():
     settings = load_settings()
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("test-session-tools")
+    sess = await sessions.get_or_create("test-session-tools")
     ctx = ToolContext(cwd=sess.cwd, session=sess, settings=settings)
 
     # write_file: ok

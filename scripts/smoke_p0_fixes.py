@@ -179,7 +179,7 @@ async def test_run_command_env_scrubbed():
     print("== test 4: run_command subprocess does not see secrets ==")
     settings = load_settings()
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("p0-env-scrub")
+    sess = await sessions.get_or_create("p0-env-scrub")
     ctx = ToolContext(cwd=sess.cwd, session=sess, settings=settings)
 
     # Seed env vars that MUST NOT reach the child.
@@ -226,14 +226,14 @@ async def test_session_manager_lru_evicts_and_flushes():
     mgr = SessionManager(settings, persistence=persistence)
 
     # Seed 3 sessions; mutate "a"'s state so we can verify flush on eviction.
-    s_a = mgr.get_or_create("user-a")
+    s_a = await mgr.get_or_create("user-a")
     s_a.current_role = "alpha_role"
-    mgr.get_or_create("user-b")
-    mgr.get_or_create("user-c")
+    await mgr.get_or_create("user-b")
+    await mgr.get_or_create("user-c")
     assert len(mgr.known_sessions()) == 3
 
     # Adding a 4th should evict user-a (LRU).
-    mgr.get_or_create("user-d")
+    await mgr.get_or_create("user-d")
     assert "user-a" not in mgr.known_sessions(), mgr.known_sessions()
     assert len(mgr.known_sessions()) == 3
 
@@ -245,7 +245,7 @@ async def test_session_manager_lru_evicts_and_flushes():
     assert persisted["current_role"] == "alpha_role", persisted
 
     # Re-touch user-a → reloaded from disk with current_role intact.
-    s_a2 = mgr.get_or_create("user-a")
+    s_a2 = await mgr.get_or_create("user-a")
     assert s_a2.current_role == "alpha_role"
     assert s_a2 is not s_a              # genuinely a fresh object
     print("  ✓ LRU evicts oldest, flushes session.json, transparent reload")
@@ -257,10 +257,10 @@ async def test_session_manager_recency_updates_on_hit():
     settings.session.max_in_memory_sessions = 2
     mgr = SessionManager(settings)
 
-    mgr.get_or_create("recent-a")
-    mgr.get_or_create("recent-b")
-    mgr.get_or_create("recent-a")                # bump "recent-a" to MRU
-    mgr.get_or_create("recent-c")                # should evict "recent-b"
+    await mgr.get_or_create("recent-a")
+    await mgr.get_or_create("recent-b")
+    await mgr.get_or_create("recent-a")          # bump "recent-a" to MRU
+    await mgr.get_or_create("recent-c")          # should evict "recent-b"
     assert "recent-a" in mgr.known_sessions()
     assert "recent-c" in mgr.known_sessions()
     assert "recent-b" not in mgr.known_sessions()
@@ -307,7 +307,7 @@ async def test_janitor_unlinks_old_files():
     for p in fresh_files:
         os.utime(p, (fresh_ts, fresh_ts))
 
-    mgr.get_or_create(sid)                       # triggers sweep
+    await mgr.get_or_create(sid)                 # triggers sweep
 
     for p in old_files:
         assert not p.exists(), f"stale file not unlinked: {p}"
@@ -325,14 +325,14 @@ async def test_janitor_throttled_by_interval():
     sid = "p0-janitor-throttle"
     cwd = mgr.workspace_for(sid)
     (cwd / "inbox").mkdir(parents=True, exist_ok=True)
-    mgr.get_or_create(sid)                        # first touch → sweep baseline
+    await mgr.get_or_create(sid)                  # first touch → sweep baseline
 
     # Plant a stale file AFTER the first sweep. A second touch within the
     # throttle window should NOT delete it.
     stale = cwd / "inbox" / "stale_after_baseline.jpg"
     stale.write_bytes(b"x")
     os.utime(stale, (time.time() - 30 * 86400,) * 2)
-    mgr.get_or_create(sid)
+    await mgr.get_or_create(sid)
     assert stale.exists(), "throttled sweep ran when it shouldn't have"
     print("  ✓ sweep_interval throttle holds")
 

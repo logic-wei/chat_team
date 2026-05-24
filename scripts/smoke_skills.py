@@ -138,7 +138,7 @@ async def test_system_prompt_injection() -> None:
     skills = SkillRegistry.load(settings.paths.user_skills_dir)
 
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("sess-prompt")
+    sess = await sessions.get_or_create("sess-prompt")
     role = _make_role("test_role", skills=["pr_review", "nonexistent"])
     sess.current_role = role.name
 
@@ -159,7 +159,7 @@ async def test_system_prompt_injection() -> None:
 
     # Empty whitelist → no block.
     role_no_skills = _make_role("test_role_2", skills=[])
-    sess2 = sessions.get_or_create("sess-prompt-no-skills")
+    sess2 = await sessions.get_or_create("sess-prompt-no-skills")
     agent2 = Agent(
         role=role_no_skills, session=sess2, settings=settings,
         llm=CapturingLLM([]), tools=ToolRegistry(), skills=skills,
@@ -179,7 +179,7 @@ async def test_skill_tool_run() -> None:
     roles = RoleRegistry({_make_role("test_role", ["pr_review"]).name: _make_role("test_role", ["pr_review"])})
 
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("sess-tool")
+    sess = await sessions.get_or_create("sess-tool")
     sess.current_role = "test_role"
 
     tool = SkillTool(skills=skills, roles=roles)
@@ -219,7 +219,7 @@ async def test_skill_read_file() -> None:
     roles = RoleRegistry({role.name: role})
 
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("sess-readfile")
+    sess = await sessions.get_or_create("sess-readfile")
     sess.current_role = "test_role"
 
     tool = SkillReadFileTool(skills=skills, roles=roles)
@@ -264,7 +264,7 @@ async def test_compactor_unaffected() -> None:
     skills = SkillRegistry.load(settings.paths.user_skills_dir)
 
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("sess-compactor")
+    sess = await sessions.get_or_create("sess-compactor")
     role = _make_role("test_role", ["secret_skill"])
     sess.current_role = role.name
     agent = Agent(
@@ -300,8 +300,8 @@ async def test_python_uv_convention() -> None:
     skills = SkillRegistry.load(settings.paths.user_skills_dir)
     sessions = SessionManager(settings)
 
-    def _prompt_for(role: Role, sid: str) -> str:
-        sess = sessions.get_or_create(sid)
+    async def _prompt_for(role: Role, sid: str) -> str:
+        sess = await sessions.get_or_create(sid)
         sess.current_role = role.name
         agent = Agent(
             role=role, session=sess, settings=settings,
@@ -310,18 +310,18 @@ async def test_python_uv_convention() -> None:
         return agent._build_system_messages()[0].content or ""
 
     role_a = _make_role("role_a", ["pr_review"], tools=["skill", "run_command"])
-    body_a = _prompt_for(role_a, "sess-uv-a")
+    body_a = await _prompt_for(role_a, "sess-uv-a")
     assert "[Python 执行约定]" in body_a, "block missing for skill+run_command role"
     assert "uv run" in body_a and "# /// script" in body_a
     print("  ✓ skill + run_command → block present")
 
     role_b = _make_role("role_b", ["pr_review"], tools=["skill", "skill_read_file"])
-    body_b = _prompt_for(role_b, "sess-uv-b")
+    body_b = await _prompt_for(role_b, "sess-uv-b")
     assert "[Python 执行约定]" not in body_b, "block leaked into skill-only role"
     print("  ✓ skill without run_command → block absent")
 
     role_c = _make_role("role_c", [], tools=["run_command", "read_file"])
-    body_c = _prompt_for(role_c, "sess-uv-c")
+    body_c = await _prompt_for(role_c, "sess-uv-c")
     assert "[Python 执行约定]" not in body_c, "block leaked into run_command-only role"
     print("  ✓ run_command without skill → block absent")
 

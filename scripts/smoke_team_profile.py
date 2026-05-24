@@ -51,12 +51,12 @@ class CapturingLLM(LLMProvider):
         return self._replies.pop(0)
 
 
-def _build_agent(home: Path):
+async def _build_agent(home: Path):
     os.environ["CHAT_TEAM_HOME"] = str(home)
     settings = load_settings()
     roles = RoleRegistry.load(settings.paths.user_roles_dir)
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("sess-team-profile")
+    sess = await sessions.get_or_create("sess-team-profile")
     role = roles.get("team_admin")
     return settings, Agent(
         role=role,
@@ -73,7 +73,7 @@ async def test_missing_team_md_no_injection() -> None:
     home.mkdir(parents=True, exist_ok=True)
     # Pre-create an empty team.md so init_home doesn't seed the template.
     (home / "team.md").write_text("", encoding="utf-8")
-    settings, agent = _build_agent(home)
+    settings, agent = await _build_agent(home)
     assert settings.team_profile == "", f"team_profile should be empty, got {settings.team_profile!r}"
     msgs = agent._build_system_messages()
     body = msgs[0].content or ""
@@ -88,7 +88,7 @@ async def test_populated_team_md_injects_block() -> None:
     home.mkdir(parents=True, exist_ok=True)
     profile = "## 我们是谁\n上海某某科技 · 客户成功部\n\n## 我们做什么\n对接 SaaS 售后,负责续约。"
     (home / "team.md").write_text(profile, encoding="utf-8")
-    settings, agent = _build_agent(home)
+    settings, agent = await _build_agent(home)
     assert settings.team_profile == profile, f"team_profile mismatch: {settings.team_profile!r}"
     msgs = agent._build_system_messages()
     body = msgs[0].content or ""
@@ -107,7 +107,7 @@ async def test_compactor_untouched() -> None:
     home.mkdir(parents=True, exist_ok=True)
     profile = "## 我们是谁\n敏感公司画像不应进入压缩器"
     (home / "team.md").write_text(profile, encoding="utf-8")
-    settings, agent = _build_agent(home)
+    settings, agent = await _build_agent(home)
     # Tighten budget and feed enough history to trigger compaction.
     agent.role.llm.history_token_budget = 50
     for i in range(10):

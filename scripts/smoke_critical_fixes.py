@@ -112,7 +112,7 @@ async def test_persistence_snapshot_under_lock():
     roles = RoleRegistry.load(settings.paths.user_roles_dir)
     tools = ToolRegistry()
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("sess-snap")
+    sess = await sessions.get_or_create("sess-snap")
 
     # Materialise an agent and pre-populate history with a known marker.
     role = roles.get("team_admin")
@@ -164,7 +164,7 @@ async def test_agent_rollback_first_call():
     roles = RoleRegistry.load(settings.paths.user_roles_dir)
     tools = ToolRegistry()
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("sess-rollback-1")
+    sess = await sessions.get_or_create("sess-rollback-1")
     role = roles.get("team_admin")
 
     llm = FailingLLM(fail_on=[1])
@@ -195,7 +195,7 @@ async def test_agent_rollback_mid_loop():
     tools = ToolRegistry()
     tools.register(TouchTool())
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("sess-rollback-2")
+    sess = await sessions.get_or_create("sess-rollback-2")
     role = roles.get("team_admin")
     role.tools = list(set(role.tools + ["touch"]))
 
@@ -243,7 +243,7 @@ async def test_dispatcher_persists_on_error():
     assert "出错" in s.final, f"expected fallback final, got: {s.final!r}"
     print(f"  ✓ stream.finish('{s.final}') called despite _run_turn raising")
 
-    sess = sessions.get_or_create("sess-disp-err")
+    sess = await sessions.get_or_create("sess-disp-err")
     state_path = sess.cwd / ".chat_team" / "session.json"
     await asyncio.sleep(0.2)
     assert state_path.exists(), "persistence.schedule should have fired"

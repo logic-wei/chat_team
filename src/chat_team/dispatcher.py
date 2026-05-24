@@ -43,7 +43,7 @@ class Dispatcher:
         self.persistence = persistence
 
     async def handle(self, msg: IncomingMessage, stream: StreamHandle) -> None:
-        session = self.sessions.get_or_create(msg.session_id)
+        session = await self.sessions.get_or_create(msg.session_id)
         # Prefer rich content_blocks (multi-modal); fall back to flat text for
         # adapters that haven't been upgraded.
         user_content = msg.content_blocks if msg.content_blocks else msg.text
@@ -64,13 +64,27 @@ class Dispatcher:
                 final = "(系统出错,请稍后再试。)"
             finally:
                 session.reset_turn_counters()
-                try:
-                    await self._post_turn(session)
-                except Exception:                              # noqa: BLE001
-                    log.exception(
-                        "post_turn failed for session=%s", session.session_id
-                    )
-            await stream.finish(final)
+
+            # Reply BEFORE post-turn work. _post_turn runs compaction, which
+            # may make an LLM round-trip per agent — without this ordering the
+            # user would wait for `_run_turn + every agent's summarisation
+            # call` before seeing the answer. stream.finish just enqueues a
+            # WS frame, so it's effectively instant; compaction can then run
+            # while the user reads the reply. We stay inside session.lock so
+            # the next turn still waits for compaction (mutates agent.history)
+            # and persistence's synchronous snapshot.
+            try:
+                await stream.finish(final)
+            except Exception:                                  # noqa: BLE001
+                log.exception(
+                    "stream.finish failed for session=%s", session.session_id,
+                )
+            try:
+                await self._post_turn(session)
+            except Exception:                                  # noqa: BLE001
+                log.exception(
+                    "post_turn failed for session=%s", session.session_id,
+                )
 
     async def _post_turn(self, session: Session) -> None:
         for agent in list(session.agents_by_role.values()):

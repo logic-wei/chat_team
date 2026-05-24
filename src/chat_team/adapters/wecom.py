@@ -193,6 +193,12 @@ class WeComBotAdapter(BotAdapter):
         # ``_shutdown`` is set only by close()/SIGINT; signals the outer
         # run_forever loop to exit.
         self._shutdown = asyncio.Event()
+        # Strong refs to in-flight callback handlers. asyncio only weakly
+        # references tasks (CPython implementation detail) — without this
+        # set, a slow callback can be garbage-collected mid-execution and
+        # silently disappear under load. Spans reconnects so an in-flight
+        # turn survives a brief WS blip.
+        self._bg_tasks: set[asyncio.Task] = set()
         # Per-connection state (rebuilt each connect iteration) ---------
         self._ws: Any = None
         self._write_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(WRITE_QUEUE_MAXSIZE)
@@ -380,9 +386,13 @@ class WeComBotAdapter(BotAdapter):
                     continue
                 cmd = msg.get("cmd") or ""
                 if cmd == "aibot_msg_callback":
-                    asyncio.create_task(self._handle_msg_callback(msg))
+                    self._spawn_bg(
+                        self._handle_msg_callback(msg), name="wecom-msg-cb",
+                    )
                 elif cmd == "aibot_event_callback":
-                    asyncio.create_task(self._handle_event_callback(msg))
+                    self._spawn_bg(
+                        self._handle_event_callback(msg), name="wecom-event-cb",
+                    )
                 elif cmd == "" and msg.get("errmsg") is not None:
                     self._dispatch_ack(msg)                 # upload/heartbeat/subscribe acks
                 else:
@@ -396,6 +406,17 @@ class WeComBotAdapter(BotAdapter):
 
     async def _enqueue_write(self, payload: dict[str, Any]) -> None:
         await self._write_queue.put(payload)
+
+    def _spawn_bg(self, coro, *, name: str | None = None) -> asyncio.Task:
+        """Create a background task and hold a strong reference to it until
+        completion. Without this, asyncio's weak-ref-only Task tracking can
+        let an in-flight handler be garbage-collected mid-await — Python's
+        docs explicitly warn about this. ``add_done_callback`` releases the
+        ref when the task finishes."""
+        task = asyncio.create_task(coro, name=name)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     # ---- message dispatch -------------------------------------------------
 

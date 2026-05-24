@@ -160,7 +160,7 @@ async def main() -> None:
     print("  statuses:", s2.statuses)
     print("  final:", s2.final)
     assert s2.final and "小研" in s2.final
-    sess = disp2.sessions.get_or_create("wecom-single-bot1-u2")
+    sess = await disp2.sessions.get_or_create("wecom-single-bot1-u2")
     assert sess.current_role == "engineer", sess.current_role
     print("  current_role after turn:", sess.current_role)
 
@@ -175,14 +175,14 @@ async def main() -> None:
     s3 = CapturingStream()
     await disp3.handle(msg("wecom-single-bot1-u3", "我叫张三"), s3)
     print("  final:", s3.final)
-    sess3 = disp3.sessions.get_or_create("wecom-single-bot1-u3")
+    sess3 = await disp3.sessions.get_or_create("wecom-single-bot1-u3")
     assert sess3.notebook.read("user_name") == "张三"
     print("  notebook[user_name]:", sess3.notebook.read("user_name"))
     print("  notebook toc:", sess3.notebook.toc())
 
     # ---- Test 4: file sandbox (read_file blocks ../) ------------------------
     print("== test 4: file sandbox ==")
-    sess4 = disp3.sessions.get_or_create("wecom-single-bot1-u4")
+    sess4 = await disp3.sessions.get_or_create("wecom-single-bot1-u4")
     (sess4.cwd / "hello.txt").write_text("hi from workspace", encoding="utf-8")
     llm4 = ScriptedLLM([
         call("read_file", {"path": "hello.txt"}, call_id="tc-rf1"),
@@ -195,7 +195,7 @@ async def main() -> None:
     await disp4.handle(msg("wecom-single-bot1-u4", "读 hello.txt 和 ../escape.txt"), s4)
     print("  final:", s4.final)
     # check tool messages in agent history
-    sess4b = disp4.sessions.get_or_create("wecom-single-bot1-u4")
+    sess4b = await disp4.sessions.get_or_create("wecom-single-bot1-u4")
     agent = sess4b.agents_by_role[sess4b.current_role]
     tool_results = [m.content for m in agent.history if m.role == "tool"]
     print("  tool results:", tool_results)

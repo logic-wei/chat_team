@@ -27,6 +27,8 @@ python scripts/smoke_vision_shim.py               # eager OCR shim (image blocks
 python scripts/smoke_llm_debug_log.py             # per-call LLM debug log: redaction + write + seq
 python scripts/smoke_skills.py                    # SkillRegistry + skill / skill_read_file tools + system-prompt TOC
 python scripts/smoke_critical_fixes.py            # persistence-race snapshot + agent turn rollback + dispatcher post_turn on _run_turn error
+python scripts/smoke_p0_fixes.py                  # reconnect + env scrub + LRU + janitor + LLM retry
+python scripts/smoke_p0_round2.py                 # _bg_tasks strong-ref + concurrent get_or_create + eviction off event loop + finish-before-post_turn
 
 # Conversational team-setup CLI (not the WeCom bot — see "Boss agent" below).
 chat-team-boss

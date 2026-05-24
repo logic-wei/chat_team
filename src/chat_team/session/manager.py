@@ -12,9 +12,17 @@ Two ops layered on top of the basic cache:
   ``sweep_interval_hours`` thereafter) walks ``inbox/``, ``.chat_team/runs/``,
   and ``.chat_team/llm/`` and unlinks files older than ``max_age_days``.
   Without this the workspace grows forever.
+
+Both ``get_or_create`` and ``_evict_if_needed`` are async because they
+perform disk I/O — JSON load on cold-cache restore, JSON dump on eviction.
+``get_or_create`` uses double-checked locking around ``_create_lock`` so
+two concurrent inbound messages for the same fresh session_id both end up
+sharing one Session object (and one ``session.lock``) instead of one
+silently overwriting the other.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -48,40 +56,41 @@ class SessionManager:
         # any unflushed delta is lost, so always wire it in production).
         self._persistence = persistence
         self._last_sweep: dict[str, float] = {}
+        # Serialises the cold-path create + eviction window across concurrent
+        # callers. Cache hits do NOT take this lock — only first-touch for a
+        # given session_id and the eviction it may trigger. Cheap creation
+        # path → near-zero contention in steady state.
+        self._create_lock = asyncio.Lock()
 
     def workspace_for(self, session_id: str) -> Path:
         return self.settings.workspace_root / sanitize_session_id(session_id)
 
-    def get_or_create(self, session_id: str) -> Session:
+    async def get_or_create(self, session_id: str) -> Session:
+        # Fast path: cache hit. Move-to-end (recency bump) and a possible
+        # janitor sweep are the only work. No lock held.
         if session_id in self._sessions:
             self._sessions.move_to_end(session_id)
             session = self._sessions[session_id]
-            self._maybe_sweep(session)
+            await self._maybe_sweep(session)
             return session
 
-        cwd = self.workspace_for(session_id)
-        cwd.mkdir(parents=True, exist_ok=True)
-        meta = cwd / ".chat_team"
-        meta.mkdir(parents=True, exist_ok=True)
-        (meta / "runs").mkdir(parents=True, exist_ok=True)
+        # Cold path: two concurrent inbound messages for the same fresh
+        # session_id can both miss the membership check above. Without
+        # this lock + re-check, both would construct a Session with
+        # distinct asyncio.Locks; the second insertion would silently
+        # overwrite the first, and any turn already running on the
+        # orphaned Session would lose serialisation against the survivor.
+        async with self._create_lock:
+            if session_id in self._sessions:
+                self._sessions.move_to_end(session_id)
+                session = self._sessions[session_id]
+            else:
+                # Disk I/O (mkdir, JSON load) off the event-loop thread.
+                session = await asyncio.to_thread(self._build_session, session_id)
+                self._sessions[session_id] = session
+                await self._evict_if_needed()
 
-        notebook = Notebook(meta / "notebook.md", max_bytes=self.settings.notebook.max_bytes)
-
-        # Restore prior current_role + histories from session.json (if any).
-        prior = load_state(cwd) or {}
-        current_role = prior.get("current_role") or self.settings.default_role
-        prior_histories = restored_histories(cwd)
-
-        session = Session(
-            session_id=session_id,
-            cwd=cwd,
-            current_role=current_role,
-            notebook=notebook,
-            restored_histories=prior_histories,
-        )
-        self._sessions[session_id] = session
-        self._evict_if_needed()
-        self._maybe_sweep(session)
+        await self._maybe_sweep(session)
         return session
 
     def known_sessions(self) -> list[str]:
@@ -92,7 +101,37 @@ class SessionManager:
 
     # ---- internals --------------------------------------------------------
 
-    def _evict_if_needed(self) -> None:
+    def _build_session(self, session_id: str) -> Session:
+        """Sync creation pipeline. Runs in a worker thread via to_thread so
+        load_state's JSON parse + restored_histories' second pass don't
+        block the event loop. Called only under ``_create_lock`` so two
+        concurrent first-touches for the same id can't both run it."""
+        cwd = self.workspace_for(session_id)
+        cwd.mkdir(parents=True, exist_ok=True)
+        meta = cwd / ".chat_team"
+        meta.mkdir(parents=True, exist_ok=True)
+        (meta / "runs").mkdir(parents=True, exist_ok=True)
+
+        notebook = Notebook(meta / "notebook.md", max_bytes=self.settings.notebook.max_bytes)
+
+        prior = load_state(cwd) or {}
+        current_role = prior.get("current_role") or self.settings.default_role
+        prior_histories = restored_histories(cwd)
+
+        return Session(
+            session_id=session_id,
+            cwd=cwd,
+            current_role=current_role,
+            notebook=notebook,
+            restored_histories=prior_histories,
+        )
+
+    async def _evict_if_needed(self) -> None:
+        """Drop LRU entries past the cap. The pre-eviction flush is the
+        slow part — it serialises the full history dict and fsyncs — so we
+        run it in a worker thread to keep the event loop responsive (otherwise
+        every new session past the cap would block heartbeat, the writer
+        task, and every other session for the duration of the write)."""
         cap = self.settings.session.max_in_memory_sessions
         if cap <= 0:
             return
@@ -101,14 +140,14 @@ class SessionManager:
             self._last_sweep.pop(sid, None)
             if self._persistence is not None:
                 try:
-                    self._persistence.flush_now(victim)
+                    await asyncio.to_thread(self._persistence.flush_now, victim)
                 except Exception:                                # noqa: BLE001
                     log.exception("flush-on-evict failed for %s", sid)
             log.info(
                 "evicted session %s (in-memory cap %d reached)", sid, cap,
             )
 
-    def _maybe_sweep(self, session: Session) -> None:
+    async def _maybe_sweep(self, session: Session) -> None:
         cfg = self.settings.cleanup
         if cfg.max_age_days <= 0:
             return
@@ -118,16 +157,33 @@ class SessionManager:
             return
         self._last_sweep[session.session_id] = now
         cutoff = time.time() - cfg.max_age_days * 86400.0
-        for rel in cfg.sweep_subdirs:
-            target = session.cwd / rel
-            try:
-                _unlink_older_than(target, cutoff)
-            except Exception:                                    # noqa: BLE001
-                log.warning(
-                    "sweep failed for %s in session %s",
-                    target, session.session_id,
-                    exc_info=True,
-                )
+        # Walk + unlink can do hundreds of stat/unlink syscalls on a long-idle
+        # workspace; push it off the event loop.
+        await asyncio.to_thread(
+            _sweep_session_dirs,
+            session.cwd,
+            list(cfg.sweep_subdirs),
+            cutoff,
+            session.session_id,
+        )
+
+
+def _sweep_session_dirs(
+    cwd: Path,
+    sweep_subdirs: list[str],
+    cutoff_ts: float,
+    session_id: str,
+) -> None:
+    for rel in sweep_subdirs:
+        target = cwd / rel
+        try:
+            _unlink_older_than(target, cutoff_ts)
+        except Exception:                                        # noqa: BLE001
+            log.warning(
+                "sweep failed for %s in session %s",
+                target, session_id,
+                exc_info=True,
+            )
 
 
 def _unlink_older_than(directory: Path, cutoff_ts: float) -> None:

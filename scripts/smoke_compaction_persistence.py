@@ -129,7 +129,7 @@ async def test_compactor_prefix_summarised():
     tools = ToolRegistry()
     tools.register(TransferToEmployeeTool(available_employees=roles.names()))
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("sess-compact")
+    sess = await sessions.get_or_create("sess-compact")
 
     role = roles.get("team_admin")
     role.llm.history_token_budget = 50            # tighten so we trip the cap
@@ -170,7 +170,7 @@ async def test_compactor_skipped_when_under_budget():
     roles = RoleRegistry.load(settings.paths.user_roles_dir)
     tools = ToolRegistry()
     sessions = SessionManager(settings)
-    sess = sessions.get_or_create("sess-skip")
+    sess = await sessions.get_or_create("sess-skip")
     role = roles.get("team_admin")
     role.llm.history_token_budget = 99999
     llm = ScriptedLLM([])
@@ -222,7 +222,7 @@ async def test_persistence_round_trip():
     await disp.handle(msg("sess-persist", "我想找研发"), s2)
     print("  turn2 final:", s2.final)
 
-    sess = sessions.get_or_create("sess-persist")
+    sess = await sessions.get_or_create("sess-persist")
     assert sess.current_role == "engineer"
     persistence.flush_now(sess)
 
@@ -237,7 +237,7 @@ async def test_persistence_round_trip():
     # Build a brand-new SessionManager pointing at the same workspace_root —
     # it should restore current_role and per-role histories from disk.
     sessions2 = SessionManager(settings)
-    sess2 = sessions2.get_or_create("sess-persist")
+    sess2 = await sessions2.get_or_create("sess-persist")
     assert sess2.current_role == "engineer"
     assert "team_admin" in sess2.restored_histories
     assert "engineer" in sess2.restored_histories
@@ -280,7 +280,7 @@ async def test_persistence_debounced_fires():
     sessions, disp = build_dispatcher(settings, llm, persistence=persistence)
     s = CapturingStream()
     await disp.handle(msg("sess-debounce", "你好"), s)
-    sess = sessions.get_or_create("sess-debounce")
+    sess = await sessions.get_or_create("sess-debounce")
     state_path = sess.cwd / ".chat_team" / "session.json"
     assert not state_path.exists(), "should not be flushed instantly"
     await asyncio.sleep(0.25)

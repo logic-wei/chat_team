@@ -125,7 +125,7 @@ async def test_chain_within_cap():
     disp = build(settings, llm)
     s = CapturingStream()
     await disp.handle(msg("sess-A", "我想找客服,但先让研发看一眼代码"), s)
-    sess = disp.sessions.get_or_create("sess-A")
+    sess = await disp.sessions.get_or_create("sess-A")
     print("  final:", s.final)
     print("  current_role:", sess.current_role)
     assert sess.current_role == "customer"
@@ -159,7 +159,7 @@ async def test_cap_forces_answer():
     disp = build(settings, llm)
     s = CapturingStream()
     await disp.handle(msg("sess-B", "你好"), s)
-    sess = disp.sessions.get_or_create("sess-B")
+    sess = await disp.sessions.get_or_create("sess-B")
     print("  final:", s.final)
     print("  transfer_count(reset_after_turn):", sess.transfer_count_this_turn)
     assert sess.transfer_count_this_turn == 0, "counter should be reset after turn"
