@@ -152,30 +152,47 @@ class PersistenceManager:
         self._pending: dict[str, asyncio.Task] = {}
 
     def schedule(self, session: "Session") -> None:
+        # Caller is responsible for holding session.lock so the snapshot below
+        # is consistent (Dispatcher._post_turn does). We snapshot here, while
+        # the lock is still held, then write asynchronously after a debounce —
+        # the worker never touches `session` again, so it can't race the next
+        # turn's mutations of agents_by_role / agent.history.
         sid = session.session_id
         old = self._pending.get(sid)
         if old and not old.done():
             old.cancel()
         delay = self.settings.session.persistence_debounce_seconds
-        self._pending[sid] = asyncio.create_task(self._delayed_flush(session, delay))
+        snap = snapshot(session)
+        cwd = session.cwd
+        self._pending[sid] = asyncio.create_task(
+            self._delayed_flush(sid, cwd, snap, delay)
+        )
 
-    async def _delayed_flush(self, session: "Session", delay: float) -> None:
+    async def _delayed_flush(
+        self,
+        session_id: str,
+        cwd: Path,
+        snap: dict[str, Any],
+        delay: float,
+    ) -> None:
         try:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
         try:
-            write_atomic(session.cwd, snapshot(session))
+            await asyncio.to_thread(write_atomic, cwd, snap)
         except Exception:                                     # noqa: BLE001
-            log.exception("debounced flush failed for %s", session.session_id)
+            log.exception("debounced flush failed for %s", session_id)
 
     def flush_now(self, session: "Session") -> None:
         write_atomic(session.cwd, snapshot(session))
 
     async def flush_all(self, sessions: list["Session"]) -> None:
-        for task in list(self._pending.values()):
-            if not task.done():
-                task.cancel()
+        tasks = [t for t in self._pending.values() if not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for s in sessions:
             try:
                 self.flush_now(s)

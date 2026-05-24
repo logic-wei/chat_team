@@ -60,6 +60,10 @@ class LLMConfig:
     # NOT enable in production (one file per call adds up fast and
     # transcripts can contain sensitive user content).
     debug_log_enabled: bool = False
+    # Hard ceiling on a single OpenAI request. Without this the AsyncOpenAI
+    # client waits forever, and since the dispatcher holds session.lock for
+    # the duration of a turn a hung request deadlocks the whole session.
+    request_timeout_seconds: float = 60.0
 
 
 @dataclass

@@ -121,58 +121,75 @@ class Agent:
         # Accept either a flat string (legacy / synthetic system-injected
         # turns from the dispatcher) or a list of ContentBlocks (multi-modal
         # user message from the adapter).
+        # Snapshot the history length BEFORE appending the user message so
+        # we can roll back the entire turn if the LLM call (or an unexpected
+        # exception) fails partway through. Without rollback a failed first
+        # call leaves a dangling user message; a failed mid-tool-loop call
+        # leaves an assistant(tool_calls) without all of its tool replies.
+        pre_turn_len = len(self.history)
         self.history.append(ChatMessage(role="user", content=user_content))
 
-        for loop_idx in range(MAX_TOOL_LOOPS):
-            sys_msgs = self._build_system_messages()
-            request = CompletionRequest(
-                messages=sys_msgs + self.history,
-                tools=self.tools.specs_for(self.role.tools),
-                model=self._model(),
-                temperature=self._temperature(),
-                image_detail=self._image_detail(),
-                image_base_dir=self.session.cwd,
-                session_id=self.session.session_id,
-                role_name=self.role.name,
-                call_kind="agent",
-                debug_log_dir=self.session.cwd / ".chat_team" / "llm",
-            )
-            response = await self.llm.complete(request)
-            assistant = response.message
-            self.history.append(assistant)
+        try:
+            for loop_idx in range(MAX_TOOL_LOOPS):
+                sys_msgs = self._build_system_messages()
+                request = CompletionRequest(
+                    messages=sys_msgs + self.history,
+                    tools=self.tools.specs_for(self.role.tools),
+                    model=self._model(),
+                    temperature=self._temperature(),
+                    image_detail=self._image_detail(),
+                    image_base_dir=self.session.cwd,
+                    session_id=self.session.session_id,
+                    role_name=self.role.name,
+                    call_kind="agent",
+                    debug_log_dir=self.session.cwd / ".chat_team" / "llm",
+                )
+                response = await self.llm.complete(request)
+                assistant = response.message
+                self.history.append(assistant)
 
-            if not assistant.tool_calls:
-                return assistant.content or ""
+                if not assistant.tool_calls:
+                    return assistant.content or ""
 
-            # Run each tool call serially. Surface errors back to the LLM.
-            for call in assistant.tool_calls:
-                await stream.status(f"调用工具: {call.name}")
-                try:
-                    result = await self._invoke_tool(call, stream)
-                except TransferRequested as transfer:
-                    # Close the dangling tool_call in our own history so this
-                    # role's transcript stays well-formed if it's revisited.
+                # Run each tool call serially. Surface errors back to the LLM.
+                for call in assistant.tool_calls:
+                    await stream.status(f"调用工具: {call.name}")
+                    try:
+                        result = await self._invoke_tool(call, stream)
+                    except TransferRequested as transfer:
+                        # Close the dangling tool_call in our own history so
+                        # this role's transcript stays well-formed if it's
+                        # revisited. Don't roll back — the closed sequence is
+                        # valid OpenAI history that the dispatcher relies on.
+                        self.history.append(ChatMessage(
+                            role="tool",
+                            content=f"[transferred] target={transfer.target}",
+                            tool_call_id=call.id,
+                            name=call.name,
+                        ))
+                        raise                              # propagate to dispatcher
+                    except ToolError as err:
+                        result = f"[tool_error] {err}"
+                    except Exception as err:               # noqa: BLE001
+                        log.exception("tool %s raised", call.name)
+                        result = f"[tool_error] {type(err).__name__}: {err}"
                     self.history.append(ChatMessage(
                         role="tool",
-                        content=f"[transferred] target={transfer.target}",
+                        content=stringify_result(result),
                         tool_call_id=call.id,
                         name=call.name,
                     ))
-                    raise                                  # propagate to dispatcher
-                except ToolError as err:
-                    result = f"[tool_error] {err}"
-                except Exception as err:                   # noqa: BLE001
-                    log.exception("tool %s raised", call.name)
-                    result = f"[tool_error] {type(err).__name__}: {err}"
-                self.history.append(ChatMessage(
-                    role="tool",
-                    content=stringify_result(result),
-                    tool_call_id=call.id,
-                    name=call.name,
-                ))
 
-        # safety fuse — too many loops without a final answer
-        return "(已达到工具循环上限,本轮未给出最终答复)"
+            # safety fuse — too many loops without a final answer
+            return "(已达到工具循环上限,本轮未给出最终答复)"
+        except TransferRequested:
+            raise
+        except Exception:
+            # LLM call timed out / 5xx'd / network died. Drop everything we
+            # appended this turn so the next turn (or the next time this
+            # role is reopened) doesn't see a malformed transcript.
+            del self.history[pre_turn_len:]
+            raise
 
     async def _invoke_tool(self, call: ToolCall, stream: StreamHandle) -> Any:
         if not self.tools.has(call.name):

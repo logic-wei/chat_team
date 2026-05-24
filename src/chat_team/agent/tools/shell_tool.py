@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import time
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,32 @@ def _truncate(text: str, max_bytes: int) -> tuple[str, bool]:
     if len(encoded) <= max_bytes:
         return text, False
     return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+async def _terminate_process_group(proc: asyncio.subprocess.Process) -> bytes:
+    """SIGTERM the whole process group, drain stdout, escalate to SIGKILL.
+
+    With start_new_session=True the child bash is its own session/pgrp leader,
+    so its pid IS the pgid and signalling that pgid hits every descendant.
+    """
+    pid = proc.pid
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+        return stdout_bytes or b""
+    except asyncio.TimeoutError:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            stdout_bytes, _ = await proc.communicate()
+            return stdout_bytes or b""
+        except Exception:                                    # noqa: BLE001
+            return b""
 
 
 class RunCommandTool(Tool):
@@ -61,22 +88,23 @@ class RunCommandTool(Tool):
         ts = time.strftime("%Y%m%d-%H%M%S")
         log_path = runs_dir / f"{ts}-{os.urandom(2).hex()}.log"
 
+        # start_new_session=True puts bash into its own process group so that
+        # `bash -c "sleep 1000 &"` style children share the pgid and can be
+        # killed together on timeout. Without this, proc.kill() only kills
+        # bash and orphans the children to the init reaper.
         proc = await asyncio.create_subprocess_shell(
             command,
             cwd=str(ctx.cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
         )
         try:
             stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             timed_out = False
         except asyncio.TimeoutError:
-            proc.kill()
-            try:
-                stdout_bytes, _ = await proc.communicate()
-            except Exception:                                # noqa: BLE001
-                stdout_bytes = b""
             timed_out = True
+            stdout_bytes = await _terminate_process_group(proc)
 
         return_code = proc.returncode if proc.returncode is not None else -1
         try:

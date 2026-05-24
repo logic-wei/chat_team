@@ -162,8 +162,15 @@ class OpenAIChatCompletionProvider(LLMProvider):
         base_url: str | None = None,
         *,
         debug_log_enabled: bool = False,
+        request_timeout_seconds: float = 60.0,
     ):
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+        # Pass timeout into the SDK client so a hung request can't hold the
+        # session lock indefinitely (the dispatcher holds it for the whole turn).
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url or None,
+            timeout=request_timeout_seconds,
+        )
         self._debug_log_enabled = debug_log_enabled
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:

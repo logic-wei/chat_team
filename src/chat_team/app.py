@@ -75,6 +75,7 @@ def build_llm_provider(settings: Settings) -> LLMProvider:
         api_key=api_key,
         base_url=base_url,
         debug_log_enabled=settings.llm.debug_log_enabled,
+        request_timeout_seconds=settings.llm.request_timeout_seconds,
     )
 
 

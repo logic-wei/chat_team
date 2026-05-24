@@ -48,12 +48,29 @@ class Dispatcher:
         # adapters that haven't been upgraded.
         user_content = msg.content_blocks if msg.content_blocks else msg.text
         async with session.lock:
+            # On any failure inside _run_turn, agent.history may have been
+            # mutated (user message appended, tool loop partially run). We
+            # still need to (1) reset per-turn counters, (2) push something
+            # back to the user via the stream, and (3) persist whatever state
+            # remains so the next turn doesn't replay the broken transcript.
+            final = ""
             try:
                 final = await self._run_turn(session, user_content, stream)
+            except Exception:                                  # noqa: BLE001
+                log.exception(
+                    "turn failed for session=%s role=%s",
+                    session.session_id, session.current_role,
+                )
+                final = "(系统出错,请稍后再试。)"
             finally:
                 session.reset_turn_counters()
+                try:
+                    await self._post_turn(session)
+                except Exception:                              # noqa: BLE001
+                    log.exception(
+                        "post_turn failed for session=%s", session.session_id
+                    )
             await stream.finish(final)
-            await self._post_turn(session)
 
     async def _post_turn(self, session: Session) -> None:
         for agent in list(session.agents_by_role.values()):
