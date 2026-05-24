@@ -631,20 +631,53 @@ class WeComBotAdapter(BotAdapter):
         if msg_id and not self._msgid_lru.add(msg_id):
             return
         if event == "enter_chat":
-            await self._reply_welcome(headers.get("req_id"))
+            session_id = self._session_id_from_body(body)
+            await self._reply_welcome(headers.get("req_id"), session_id)
         elif event == "disconnected_event":
             log.warning("received disconnected_event; closing")
             self._stop.set()
         else:
             log.info("event ignored: %s", event)
 
-    async def _reply_welcome(self, req_id: str | None) -> None:
+    def _session_id_from_body(self, body: dict[str, Any]) -> str | None:
+        """Compute the same session_id _parse_metadata would, using only the
+        routing fields available on every callback (msg or event). Returns
+        None if the body lacks enough info to identify the session."""
+        chat_type_raw = body.get("chattype") or "single"
+        chat_id = body.get("chatid")
+        aibot_id = body.get("aibotid") or self.bot_id
+        from_user = (body.get("from") or {}).get("userid") or ""
+        if chat_type_raw == "group" and chat_id:
+            return f"wecom-group-{chat_id}"
+        if from_user:
+            return f"wecom-single-{aibot_id}-{from_user}"
+        return None
+
+    async def _reply_welcome(
+        self,
+        req_id: str | None,
+        session_id: str | None = None,
+    ) -> None:
         from ..roles.registry import RoleRegistry
+        from ..session.persistence import load_state
         roles = RoleRegistry.load(self.settings.paths.user_roles_dir)
-        default = self.settings.default_role
+        # Pick whichever role the user will *actually* talk to next: the
+        # persisted current_role for this session if any, otherwise the
+        # global default. Without this, a returning user sees admin's
+        # "我是小管" while their messages still route to e.g. engineer.
+        role_name = self.settings.default_role
+        if session_id and self._workspace_resolver is not None:
+            try:
+                cwd = self._workspace_resolver(session_id)
+                state = load_state(cwd)
+            except Exception:                                # noqa: BLE001
+                state = None
+            prior_role = (state or {}).get("current_role")
+            if prior_role and roles.has(prior_role):
+                role_name = prior_role
         welcome = ""
-        if roles.has(default):
-            welcome = (roles.get(default).welcome_message or "").strip()
+        if roles.has(role_name):
+            welcome = (roles.get(role_name).welcome_message or "").strip()
         if not welcome:
             welcome = "你好,我是这个团队的机器人助手。"
         payload = {

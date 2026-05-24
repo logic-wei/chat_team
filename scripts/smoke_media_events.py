@@ -279,6 +279,80 @@ async def test_event_flow():
     print("  ✓ disconnected_event raised stop flag")
 
 
+async def test_welcome_matches_persisted_current_role():
+    print("== test 5b: enter_chat welcome uses session's current_role, not default ==")
+    import json as _json
+    settings = load_settings()
+    settings.env.update({"WECOM_BOT_ID": "BOT", "WECOM_SECRET": "S"})
+
+    # Seed a non-default role with its own welcome_message.
+    role_path = settings.paths.user_roles_dir / "engineer.yaml"
+    role_path.write_text(
+        "name: engineer\n"
+        "display_name: 小研\n"
+        "system_prompt: 你是研发同事。\n"
+        "welcome_message: |\n"
+        "  你好,我是小研,继续上次的代码讨论吧。\n"
+        "tools:\n"
+        "  - notebook_read\n",
+        encoding="utf-8",
+    )
+
+    # Pre-populate a session.json with current_role=engineer for the user
+    # who's about to enter the chat — mimics a returning user mid-handoff.
+    session_id = "wecom-single-BOT-U_RETURN"
+    cwd = settings.workspace_root / session_id
+    (cwd / ".chat_team").mkdir(parents=True, exist_ok=True)
+    (cwd / ".chat_team" / "session.json").write_text(_json.dumps({
+        "session_id": session_id,
+        "current_role": "engineer",
+        "histories": {"engineer": [
+            {"role": "user", "content": "之前的问题"},
+            {"role": "assistant", "content": "之前的回答"},
+        ]},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    def workspace_for(sid):
+        return settings.workspace_root / sid
+
+    adapter = WeComBotAdapter(settings, workspace_resolver=workspace_for)
+    sent: list[dict] = []
+    async def fake_enqueue(p):
+        sent.append(p)
+    adapter._enqueue_write = fake_enqueue
+
+    enter_frame = {
+        "cmd": "aibot_event_callback", "headers": {"req_id": "ev-ret"},
+        "body": {
+            "msgid": "E-RET", "aibotid": "BOT", "chattype": "single",
+            "from": {"userid": "U_RETURN"}, "msgtype": "event",
+            "event": {"eventtype": "enter_chat"},
+        },
+    }
+    await adapter._handle_event_callback(enter_frame)
+    assert sent, "no welcome frame queued"
+    text = sent[0]["body"]["text"]["content"]
+    print("  welcome text:", text.strip())
+    assert "小研" in text, f"expected engineer's welcome, got: {text!r}"
+    assert "小管" not in text, f"engineer session got admin welcome: {text!r}"
+
+    # Fresh user (no session.json) still gets default-role welcome.
+    sent.clear()
+    fresh_frame = {
+        "cmd": "aibot_event_callback", "headers": {"req_id": "ev-fresh"},
+        "body": {
+            "msgid": "E-FRESH", "aibotid": "BOT", "chattype": "single",
+            "from": {"userid": "U_FRESH"}, "msgtype": "event",
+            "event": {"eventtype": "enter_chat"},
+        },
+    }
+    await adapter._handle_event_callback(fresh_frame)
+    fresh_text = sent[0]["body"]["text"]["content"]
+    print("  fresh welcome:", fresh_text.strip()[:30], "...")
+    assert "小研" not in fresh_text, "fresh user must not see engineer welcome"
+    print("  ✓ welcome correctly tracks current_role per session")
+
+
 # --- 6. quote payloads -----------------------------------------------------
 
 def _build_quote_adapter(settings, cipher_by_url):
@@ -450,6 +524,7 @@ async def main():
     await test_adapter_image_flow()
     await test_adapter_mixed_flow()
     await test_event_flow()
+    await test_welcome_matches_persisted_current_role()
     await test_quote_text()
     await test_quote_image()
     await test_quote_mixed_multi_image_with_group_strip()
