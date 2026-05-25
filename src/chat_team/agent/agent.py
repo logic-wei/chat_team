@@ -35,8 +35,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-MAX_TOOL_LOOPS = 8                         # bound the chat+tool loop per turn
-
 # Injected into a role's system prompt only when the role exposes both `skill`
 # and `run_command`. The combination is a strong signal the agent will be asked
 # to execute Python emitted by skill bodies — community skills can't be modified
@@ -130,7 +128,7 @@ class Agent:
         self.history.append(ChatMessage(role="user", content=user_content))
 
         try:
-            for loop_idx in range(MAX_TOOL_LOOPS):
+            for loop_idx in range(self.settings.llm.max_tool_loops_per_turn):
                 sys_msgs = self._build_system_messages()
                 request = CompletionRequest(
                     messages=sys_msgs + self.history,

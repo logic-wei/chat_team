@@ -94,6 +94,11 @@ class LLMConfig:
     # Base delay before the second attempt; doubled each retry with up to
     # 0.5s of random jitter on top to avoid thundering-herd reconnects.
     retry_initial_delay: float = 1.0
+    # Max LLM↔tool round-trips inside a single turn before the agent gives
+    # up and returns a fuse message. Skill-driven flows (load SKILL.md →
+    # write script → `uv run` → re-read failure → fix deps → re-run → …)
+    # routinely need more than the previous fixed cap of 8.
+    max_tool_loops_per_turn: int = 16
 
 
 @dataclass
