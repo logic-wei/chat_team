@@ -82,6 +82,11 @@ class LLMConfig:
     # NOT enable in production (one file per call adds up fast and
     # transcripts can contain sensitive user content).
     debug_log_enabled: bool = False
+    # When true, record every outbound HTTP request for LLM calls (headers
+    # + full body) to per-session JSON files under <workspace>/.chat_team/
+    # llm_http/. Includes sensitive fields (for example Authorization).
+    # Keep OFF in production; use only for short local debugging windows.
+    http_debug_log_enabled: bool = False
     # Hard ceiling on a single OpenAI request. Without this the AsyncOpenAI
     # client waits forever, and since the dispatcher holds session.lock for
     # the duration of a turn a hung request deadlocks the whole session.

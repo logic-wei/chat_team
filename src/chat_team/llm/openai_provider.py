@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import random
+import secrets
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import httpx
 from openai import (
     APIConnectionError,
     APITimeoutError,
@@ -20,6 +24,7 @@ from openai import (
 
 from ..adapters.base import blocks_to_text
 from . import debug_logger
+from . import http_debug_logger
 from .base import (
     ChatMessage,
     CompletionRequest,
@@ -36,6 +41,22 @@ _RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
     APIConnectionError,
     RateLimitError,
     InternalServerError,
+)
+
+
+@dataclass
+class _HttpLogContext:
+    dir_path: Path
+    session_id: str | None
+    role_name: str | None
+    call_kind: str | None
+    call_id: str
+    request_index: int = 0
+
+
+_http_log_ctx: contextvars.ContextVar[_HttpLogContext | None] = contextvars.ContextVar(
+    "chat_team_http_log_ctx",
+    default=None,
 )
 
 
@@ -180,10 +201,22 @@ class OpenAIChatCompletionProvider(LLMProvider):
         base_url: str | None = None,
         *,
         debug_log_enabled: bool = False,
+        http_debug_log_enabled: bool = False,
         request_timeout_seconds: float = 60.0,
         max_retries: int = 3,
         retry_initial_delay: float = 1.0,
     ):
+        self._http_debug_log_enabled = http_debug_log_enabled
+        event_hooks: dict[str, list[Any]] | None = None
+        if http_debug_log_enabled:
+            event_hooks = {
+                "request": [self._on_http_request],
+                "response": [self._on_http_response],
+            }
+        http_client = httpx.AsyncClient(
+            timeout=request_timeout_seconds,
+            event_hooks=event_hooks,
+        )
         # Pass timeout into the SDK client so a hung request can't hold the
         # session lock indefinitely (the dispatcher holds it for the whole turn).
         # max_retries=0 disables the SDK's own retry layer so our outer loop
@@ -191,6 +224,7 @@ class OpenAIChatCompletionProvider(LLMProvider):
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url or None,
+            http_client=http_client,
             timeout=request_timeout_seconds,
             max_retries=0,
         )
@@ -199,6 +233,15 @@ class OpenAIChatCompletionProvider(LLMProvider):
         self._retry_initial_delay = max(0.0, float(retry_initial_delay))
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
+        token = None
+        if self._http_debug_log_enabled and request.debug_log_dir is not None:
+            token = _http_log_ctx.set(_HttpLogContext(
+                dir_path=request.debug_log_dir.parent / "llm_http",
+                session_id=request.session_id,
+                role_name=request.role_name,
+                call_kind=request.call_kind,
+                call_id=secrets.token_hex(8),
+            ))
         messages_payload = _to_openai_messages(
             request.messages,
             image_detail=request.image_detail,
@@ -218,25 +261,29 @@ class OpenAIChatCompletionProvider(LLMProvider):
         attempts = 0
         completion = None
         last_exc: Exception | None = None
-        for attempt in range(self._max_retries):
-            attempts = attempt + 1
-            try:
-                completion = await self._client.chat.completions.create(**kwargs)
-                break
-            except _RETRYABLE_EXCEPTIONS as exc:
-                last_exc = exc
-                if attempt >= self._max_retries - 1:
+        try:
+            for attempt in range(self._max_retries):
+                attempts = attempt + 1
+                try:
+                    completion = await self._client.chat.completions.create(**kwargs)
                     break
-                delay = self._retry_initial_delay * (2 ** attempt) + random.uniform(0, 0.5)
-                log.warning(
-                    "LLM call failed (%s) on attempt %d/%d; retrying in %.2fs",
-                    type(exc).__name__, attempts, self._max_retries, delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-            except Exception as exc:                              # noqa: BLE001
-                last_exc = exc
-                break
+                except _RETRYABLE_EXCEPTIONS as exc:
+                    last_exc = exc
+                    if attempt >= self._max_retries - 1:
+                        break
+                    delay = self._retry_initial_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                    log.warning(
+                        "LLM call failed (%s) on attempt %d/%d; retrying in %.2fs",
+                        type(exc).__name__, attempts, self._max_retries, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                except Exception as exc:                              # noqa: BLE001
+                    last_exc = exc
+                    break
+        finally:
+            if token is not None:
+                _http_log_ctx.reset(token)
 
         if completion is None:
             latency_ms = (time.monotonic() - t0) * 1000.0
@@ -290,6 +337,57 @@ class OpenAIChatCompletionProvider(LLMProvider):
             message=chat_msg,
             finish_reason=choice.finish_reason or "stop",
             raw=completion,
+        )
+
+    async def _on_http_request(self, request: httpx.Request) -> None:
+        ctx = _http_log_ctx.get()
+        if ctx is None:
+            return
+        try:
+            body_bytes = request.content if request.content else b""
+        except Exception:                                          # noqa: BLE001
+            body_bytes = None
+        ctx.request_index += 1
+        request.extensions["chat_team_http_request_index"] = ctx.request_index
+        http_debug_logger.write_http_request_log(
+            dir_path=ctx.dir_path,
+            session_id=ctx.session_id,
+            role_name=ctx.role_name,
+            call_kind=ctx.call_kind,
+            call_id=ctx.call_id,
+            request_index=ctx.request_index,
+            method=request.method,
+            url=str(request.url),
+            headers_raw=list(request.headers.raw),
+            body_bytes=body_bytes,
+        )
+
+    async def _on_http_response(self, response: httpx.Response) -> None:
+        ctx = _http_log_ctx.get()
+        if ctx is None:
+            return
+        request = response.request
+        try:
+            body_bytes = await response.aread()
+        except Exception:                                          # noqa: BLE001
+            body_bytes = None
+        request_index = request.extensions.get("chat_team_http_request_index")
+        if not isinstance(request_index, int) or request_index <= 0:
+            ctx.request_index += 1
+            request_index = ctx.request_index
+        http_debug_logger.write_http_response_log(
+            dir_path=ctx.dir_path,
+            session_id=ctx.session_id,
+            role_name=ctx.role_name,
+            call_kind=ctx.call_kind,
+            call_id=ctx.call_id,
+            request_index=request_index,
+            method=request.method,
+            url=str(request.url),
+            status_code=response.status_code,
+            reason_phrase=response.reason_phrase or "",
+            headers_raw=list(response.headers.raw),
+            body_bytes=body_bytes,
         )
 
     def _maybe_write_log(
