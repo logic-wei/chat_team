@@ -36,6 +36,8 @@ from .image_cache import ImageDataURICache, default_cache
 
 log = logging.getLogger(__name__)
 
+_OPENCODE_USER_AGENT = "OpenCode/1.0"
+
 _RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
     APITimeoutError,
     APIConnectionError,
@@ -226,6 +228,7 @@ class OpenAIChatCompletionProvider(LLMProvider):
             api_key=api_key,
             base_url=base_url or None,
             http_client=http_client,
+            default_headers={"User-Agent": _OPENCODE_USER_AGENT},
             timeout=request_timeout_seconds,
             max_retries=0,
         )
