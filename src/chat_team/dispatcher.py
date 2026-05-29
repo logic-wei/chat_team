@@ -5,6 +5,7 @@ the new agent on the original user message).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from .adapters.base import IncomingMessage, StreamHandle
@@ -54,7 +55,15 @@ class Dispatcher:
             # back to the user via the stream, and (3) persist whatever state
             # remains so the next turn doesn't replay the broken transcript.
             final = ""
+            heartbeat_task: asyncio.Task | None = None
+            heartbeat_stop = asyncio.Event()
             try:
+                if self.settings.session.progress_status_enabled:
+                    await stream.status("已收到,正在处理...")
+                    heartbeat_task = asyncio.create_task(
+                        self._progress_heartbeat(stream, heartbeat_stop),
+                        name=f"progress-heartbeat-{session.session_id}",
+                    )
                 final = await self._run_turn(session, user_content, stream)
             except Exception:                                  # noqa: BLE001
                 log.exception(
@@ -63,6 +72,12 @@ class Dispatcher:
                 )
                 final = "(系统出错,请稍后再试。)"
             finally:
+                heartbeat_stop.set()
+                if heartbeat_task is not None:
+                    try:
+                        await heartbeat_task
+                    except Exception:                          # noqa: BLE001
+                        log.debug("progress heartbeat ended with error", exc_info=True)
                 session.reset_turn_counters()
 
             # Reply BEFORE post-turn work. _post_turn runs compaction, which
@@ -85,6 +100,27 @@ class Dispatcher:
                 log.exception(
                     "post_turn failed for session=%s", session.session_id,
                 )
+
+    async def _progress_heartbeat(self, stream: StreamHandle, stop: asyncio.Event) -> None:
+        delay = max(0.0, float(self.settings.session.progress_status_delay_seconds))
+        interval = max(0.2, float(self.settings.session.progress_status_interval_seconds))
+        text = (self.settings.session.progress_status_text or "").strip() or "正在处理,请稍候..."
+
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=delay)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        while not stop.is_set():
+            try:
+                await stream.status(text)
+            except Exception:                                  # noqa: BLE001
+                log.debug("progress status push failed", exc_info=True)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
 
     async def _post_turn(self, session: Session) -> None:
         for agent in list(session.agents_by_role.values()):

@@ -142,7 +142,9 @@ async def main() -> None:
     s = CapturingStream()
     await disp.handle(msg("wecom-single-bot1-u1", "你好"), s)
     assert s.final and "小管" in s.final, f"final={s.final!r}"
+    assert any("已收到" in note for note in s.statuses), s.statuses
     print("  final:", s.final)
+    print("  statuses:", s.statuses)
 
     # ---- Test 2: admin transfers to the seeded test engineer role -----------
     print("== test 2: admin → engineer transfer ==")
@@ -160,6 +162,8 @@ async def main() -> None:
     print("  statuses:", s2.statuses)
     print("  final:", s2.final)
     assert s2.final and "小研" in s2.final
+    assert any("已收到" in note for note in s2.statuses), s2.statuses
+    assert any("交接给" in note for note in s2.statuses), s2.statuses
     sess = await disp2.sessions.get_or_create("wecom-single-bot1-u2")
     assert sess.current_role == "engineer", sess.current_role
     print("  current_role after turn:", sess.current_role)
@@ -175,6 +179,7 @@ async def main() -> None:
     s3 = CapturingStream()
     await disp3.handle(msg("wecom-single-bot1-u3", "我叫张三"), s3)
     print("  final:", s3.final)
+    assert any("已收到" in note for note in s3.statuses), s3.statuses
     sess3 = await disp3.sessions.get_or_create("wecom-single-bot1-u3")
     assert sess3.notebook.read("user_name") == "张三"
     print("  notebook[user_name]:", sess3.notebook.read("user_name"))
@@ -194,6 +199,7 @@ async def main() -> None:
     s4 = CapturingStream()
     await disp4.handle(msg("wecom-single-bot1-u4", "读 hello.txt 和 ../escape.txt"), s4)
     print("  final:", s4.final)
+    assert any("已收到" in note for note in s4.statuses), s4.statuses
     # check tool messages in agent history
     sess4b = await disp4.sessions.get_or_create("wecom-single-bot1-u4")
     agent = sess4b.agents_by_role[sess4b.current_role]

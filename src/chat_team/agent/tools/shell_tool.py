@@ -116,6 +116,9 @@ class RunCommandTool(Tool):
         if timeout <= 0 or timeout > 600:
             raise ToolError("timeout must be in (0, 600] seconds")
 
+        if ctx.stream is not None:
+            await ctx.stream.status("run_command 运行中...")
+
         runs_dir = ctx.cwd / ".chat_team" / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d-%H%M%S")
@@ -144,6 +147,11 @@ class RunCommandTool(Tool):
             stdout_bytes = await _terminate_process_group(proc)
 
         return_code = proc.returncode if proc.returncode is not None else -1
+        if ctx.stream is not None:
+            if timed_out:
+                await ctx.stream.status("run_command 超时,已终止")
+            else:
+                await ctx.stream.status(f"run_command 完成(exit={return_code})")
         try:
             log_path.write_bytes(stdout_bytes or b"")
         except OSError:

@@ -17,6 +17,12 @@ class SessionConfig:
     msgid_lru_size: int = 500
     persistence_debounce_seconds: float = 10.0
     per_turn_transfer_cap: int = 3
+    # UX: while the agent is still working, periodically push a transient
+    # status line so WeCom users don't stare at a silent chat window.
+    progress_status_enabled: bool = True
+    progress_status_delay_seconds: float = 1.5
+    progress_status_interval_seconds: float = 2.5
+    progress_status_text: str = "正在处理,请稍候..."
     # Hard cap on Sessions held in memory. When exceeded, the LRU entry is
     # flushed to session.json and evicted; the user transparently reloads
     # from disk on next message. Without this, every distinct user × bot

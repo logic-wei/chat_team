@@ -12,6 +12,10 @@ session:
   msgid_lru_size: 500                # WeCom callback dedup window
   persistence_debounce_seconds: 10   # session.json flush debounce
   per_turn_transfer_cap: 3           # max employee handoffs per user turn
+  progress_status_enabled: true      # push periodic "still working" status while a turn is running
+  progress_status_delay_seconds: 1.5 # first heartbeat delay after turn starts
+  progress_status_interval_seconds: 2.5 # heartbeat interval during long processing
+  progress_status_text: 正在处理,请稍候... # transient status text shown before final answer
 
 notebook:
   max_bytes: 4096                    # soft cap for notebook.md (4KB)
