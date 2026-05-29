@@ -30,6 +30,10 @@ llm:
   default_image_detail: high         # vision tile granularity: low | high | auto. high ≈ 1600 tokens / 1024² image — bump history budget if you keep many images in context, or set "low" per-role.
   debug_log_enabled: false           # write one JSON per LLM call to <workspace>/.chat_team/llm/. base64 image data is redacted. OFF in production — turn on only for local debugging; one file per call piles up fast.
   http_debug_log_enabled: false      # write JSON logs for LLM HTTP requests + responses to <workspace>/.chat_team/llm_http/ with full headers+body (no redaction). OFF in production; contains sensitive data.
+  use_streaming: true                # use provider-side streaming and assemble the final answer from chunks; helps avoid read-timeout failures on slow first-token responses.
+  request_timeout_seconds: 60        # per-attempt timeout ceiling for one LLM request.
+  max_retries: 3                     # total attempts including first call (transient errors only).
+  retry_initial_delay: 1.0           # backoff base seconds before retry, with jitter.
 
 logging:
   max_bytes: 10485760                # 10 MB per log file

@@ -3,6 +3,7 @@ and translate to/from the dataclasses below."""
 from __future__ import annotations
 
 import abc
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -56,6 +57,9 @@ class CompletionRequest:
     role_name: str | None = None
     call_kind: str | None = None  # "agent" | "compactor" | "vision"
     debug_log_dir: Path | None = None
+    # Optional live callback for provider-side streaming. Provider passes the
+    # cumulative assistant text seen so far (not just the latest delta).
+    stream_text_callback: Callable[[str], Awaitable[None]] | None = None
 
 
 @dataclass

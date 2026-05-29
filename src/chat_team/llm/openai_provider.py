@@ -205,6 +205,7 @@ class OpenAIChatCompletionProvider(LLMProvider):
         request_timeout_seconds: float = 60.0,
         max_retries: int = 3,
         retry_initial_delay: float = 1.0,
+        use_streaming: bool = True,
     ):
         self._http_debug_log_enabled = http_debug_log_enabled
         event_hooks: dict[str, list[Any]] | None = None
@@ -231,6 +232,120 @@ class OpenAIChatCompletionProvider(LLMProvider):
         self._debug_log_enabled = debug_log_enabled
         self._max_retries = max(1, int(max_retries))
         self._retry_initial_delay = max(0.0, float(retry_initial_delay))
+        self._use_streaming = bool(use_streaming)
+
+    @staticmethod
+    def _build_tool_calls_from_deltas(
+        tool_calls_by_index: dict[int, dict[str, str]],
+    ) -> list[ToolCall]:
+        out: list[ToolCall] = []
+        for idx in sorted(tool_calls_by_index):
+            item = tool_calls_by_index[idx]
+            raw_args = item.get("arguments", "")
+            try:
+                args = json.loads(raw_args or "{}")
+            except json.JSONDecodeError:
+                args = {"_raw": raw_args}
+            out.append(ToolCall(
+                id=item.get("id") or f"tool_call_{idx}",
+                name=item.get("name") or "",
+                arguments=args,
+            ))
+        return out
+
+    async def _complete_with_streaming(
+        self,
+        kwargs: dict[str, Any],
+        stream_text_callback=None,
+    ) -> tuple[ChatMessage, str, dict[str, Any] | None, Any | None]:
+        # Some tests monkey-patch create() with a non-stream fake object. If
+        # the returned value is not async-iterable, treat it as non-stream.
+        maybe_stream = await self._client.chat.completions.create(**kwargs, stream=True)
+        if not hasattr(maybe_stream, "__aiter__"):
+            completion = maybe_stream
+            choice = completion.choices[0]
+            msg = choice.message
+            tool_calls: list[ToolCall] = []
+            for tc in (msg.tool_calls or []):
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {"_raw": tc.function.arguments}
+                tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
+            usage = None
+            if getattr(completion, "usage", None) is not None:
+                try:
+                    usage = completion.usage.model_dump()
+                except Exception:                                 # noqa: BLE001
+                    usage = None
+            return (
+                ChatMessage(role="assistant", content=msg.content or "", tool_calls=tool_calls),
+                choice.finish_reason or "stop",
+                usage,
+                completion,
+            )
+
+        content_parts: list[str] = []
+        tool_calls_by_index: dict[int, dict[str, str]] = {}
+        finish_reason = "stop"
+        usage: dict[str, Any] | None = None
+        raw_last_chunk: Any | None = None
+
+        async for chunk in maybe_stream:
+            raw_last_chunk = chunk
+            if getattr(chunk, "usage", None) is not None:
+                try:
+                    usage = chunk.usage.model_dump()
+                except Exception:                                 # noqa: BLE001
+                    usage = None
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            choice = choices[0]
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            part = getattr(delta, "content", None)
+            if part:
+                content_parts.append(part)
+                if stream_text_callback is not None:
+                    try:
+                        await stream_text_callback("".join(content_parts))
+                    except Exception:                             # noqa: BLE001
+                        log.debug("stream_text_callback failed", exc_info=True)
+            for tc in (getattr(delta, "tool_calls", None) or []):
+                idx = getattr(tc, "index", None)
+                if idx is None:
+                    idx = len(tool_calls_by_index)
+                state = tool_calls_by_index.setdefault(idx, {
+                    "id": "",
+                    "name": "",
+                    "arguments": "",
+                })
+                tc_id = getattr(tc, "id", None)
+                if tc_id:
+                    state["id"] = tc_id
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    fn_name = getattr(fn, "name", None)
+                    if fn_name:
+                        state["name"] = fn_name
+                    fn_args = getattr(fn, "arguments", None)
+                    if fn_args:
+                        state["arguments"] += fn_args
+
+        return (
+            ChatMessage(
+                role="assistant",
+                content="".join(content_parts),
+                tool_calls=self._build_tool_calls_from_deltas(tool_calls_by_index),
+            ),
+            finish_reason,
+            usage,
+            raw_last_chunk,
+        )
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         token = None
@@ -260,12 +375,22 @@ class OpenAIChatCompletionProvider(LLMProvider):
         t0 = time.monotonic()
         attempts = 0
         completion = None
+        response_msg: ChatMessage | None = None
+        finish_reason: str | None = None
+        usage: dict[str, Any] | None = None
+        raw_obj: Any | None = None
         last_exc: Exception | None = None
         try:
             for attempt in range(self._max_retries):
                 attempts = attempt + 1
                 try:
-                    completion = await self._client.chat.completions.create(**kwargs)
+                    if self._use_streaming:
+                        response_msg, finish_reason, usage, raw_obj = await self._complete_with_streaming(
+                            kwargs,
+                            stream_text_callback=request.stream_text_callback,
+                        )
+                    else:
+                        completion = await self._client.chat.completions.create(**kwargs)
                     break
                 except _RETRYABLE_EXCEPTIONS as exc:
                     last_exc = exc
@@ -285,7 +410,7 @@ class OpenAIChatCompletionProvider(LLMProvider):
             if token is not None:
                 _http_log_ctx.reset(token)
 
-        if completion is None:
+        if completion is None and response_msg is None:
             latency_ms = (time.monotonic() - t0) * 1000.0
             self._maybe_write_log(
                 request,
@@ -301,42 +426,60 @@ class OpenAIChatCompletionProvider(LLMProvider):
             raise last_exc
 
         latency_ms = (time.monotonic() - t0) * 1000.0
-        choice = completion.choices[0]
-        msg = choice.message
+        if response_msg is None:
+            assert completion is not None
+            choice = completion.choices[0]
+            msg = choice.message
+            tool_calls: list[ToolCall] = []
+            for tc in (msg.tool_calls or []):
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {"_raw": tc.function.arguments}
+                tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
+            response_msg = ChatMessage(
+                role="assistant",
+                content=msg.content or "",
+                tool_calls=tool_calls,
+            )
+            finish_reason = choice.finish_reason or "stop"
+            if getattr(completion, "usage", None) is not None:
+                try:
+                    usage = completion.usage.model_dump()
+                except Exception:                                 # noqa: BLE001
+                    usage = None
+            raw_obj = completion
 
-        tool_calls: list[ToolCall] = []
-        for tc in (msg.tool_calls or []):
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {"_raw": tc.function.arguments}
-            tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
-
-        chat_msg = ChatMessage(
-            role="assistant",
-            content=msg.content or "",
-            tool_calls=tool_calls,
-        )
-        usage = None
-        if getattr(completion, "usage", None) is not None:
-            try:
-                usage = completion.usage.model_dump()
-            except Exception:                                     # noqa: BLE001
-                usage = None
+        serialised_response = {
+            "role": "assistant",
+            "content": response_msg.content,
+        }
+        if response_msg.tool_calls:
+            serialised_response["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                    },
+                }
+                for tc in response_msg.tool_calls
+            ]
         self._maybe_write_log(
             request,
             messages_payload=messages_payload,
-            response_message=debug_logger._serialise_response_message(msg),
-            finish_reason=choice.finish_reason,
+            response_message=serialised_response,
+            finish_reason=finish_reason,
             usage=usage,
             latency_ms=latency_ms,
             error=None,
             attempts=attempts,
         )
         return CompletionResponse(
-            message=chat_msg,
-            finish_reason=choice.finish_reason or "stop",
-            raw=completion,
+            message=response_msg,
+            finish_reason=finish_reason or "stop",
+            raw=raw_obj,
         )
 
     async def _on_http_request(self, request: httpx.Request) -> None:

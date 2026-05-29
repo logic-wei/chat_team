@@ -141,6 +141,9 @@ class Agent:
                     role_name=self.role.name,
                     call_kind="agent",
                     debug_log_dir=self.session.cwd / ".chat_team" / "llm",
+                    # Replace stream preview with cumulative text so users see
+                    # live progress while the provider is still generating.
+                    stream_text_callback=lambda text: stream.push(text, append=False),
                 )
                 response = await self.llm.complete(request)
                 assistant = response.message

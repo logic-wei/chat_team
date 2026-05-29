@@ -87,6 +87,11 @@ class LLMConfig:
     # llm_http/. Includes sensitive fields (for example Authorization).
     # Keep OFF in production; use only for short local debugging windows.
     http_debug_log_enabled: bool = False
+    # When true, provider uses OpenAI streaming under the hood and assembles
+    # the final assistant message from chunks. This keeps long calls alive as
+    # long as bytes keep arriving, reducing read-timeout failures near the
+    # first token boundary.
+    use_streaming: bool = True
     # Hard ceiling on a single OpenAI request. Without this the AsyncOpenAI
     # client waits forever, and since the dispatcher holds session.lock for
     # the duration of a turn a hung request deadlocks the whole session.
