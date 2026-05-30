@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-KEEP_LAST_USER_TURNS = 6                # keep this many recent user→answer cycles verbatim
+KEEP_LAST_USER_TURNS = 6                # upper bound: keep up to this many recent user→answer cycles verbatim
 PER_MESSAGE_OVERHEAD_TOKENS = 4         # OpenAI roughly charges ~3-4 framing tokens per msg
 
 _ENCODING: tiktoken.Encoding | None = None
@@ -70,9 +70,12 @@ def count_tokens(messages: Iterable[ChatMessage]) -> int:
 
 def _find_keep_boundary(history: list[ChatMessage], keep_user_turns: int) -> int:
     user_indices = [i for i, m in enumerate(history) if m.role == "user"]
-    if len(user_indices) <= keep_user_turns:
+    # Keep at least one most-recent user turn intact, but still compact when
+    # a short history (e.g. exactly 6 turns) already blows past budget.
+    if len(user_indices) <= 1:
         return 0
-    return user_indices[-keep_user_turns]
+    keep = min(keep_user_turns, len(user_indices) - 1)
+    return user_indices[-keep]
 
 
 def _render_for_summary(messages: list[ChatMessage]) -> str:
@@ -138,8 +141,8 @@ async def maybe_compact(agent: "Agent", llm: LLMProvider) -> bool:
     boundary = _find_keep_boundary(agent.history, KEEP_LAST_USER_TURNS)
     if boundary <= 0:
         log.info(
-            "role=%s over budget (%d > %d) but only %d user turns; nothing safe to compact",
-            agent.role.name, tokens, budget, sum(1 for m in agent.history if m.role == "user"),
+            "role=%s over budget (%d > %d) but has <=1 user turn; nothing safe to compact",
+            agent.role.name, tokens, budget,
         )
         return False
 

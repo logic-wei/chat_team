@@ -183,6 +183,35 @@ async def test_compactor_skipped_when_under_budget():
     print("  ok — no compaction")
 
 
+async def test_compactor_six_turns_still_compacts():
+    print("== test 2b: exactly 6 user turns can still compact ==")
+    settings = load_settings()
+    roles = RoleRegistry.load(settings.paths.user_roles_dir)
+    tools = ToolRegistry()
+    sessions = SessionManager(settings)
+    sess = await sessions.get_or_create("sess-six-turns")
+
+    role = roles.get("team_admin")
+    role.llm.history_token_budget = 50
+    llm = ScriptedLLM([])
+    agent = Agent(role=role, session=sess, settings=settings, llm=llm, tools=tools)
+
+    # Exactly 6 user turns, but each turn is large enough to exceed budget.
+    for i in range(6):
+        agent.history.append(ChatMessage(role="user", content=f"用户问题 {i}: " + "x" * 80))
+        agent.history.append(ChatMessage(role="assistant", content=f"回答 {i}: " + "y" * 80))
+
+    assert count_tokens(agent.history) > 50
+    did = await maybe_compact(agent, llm)
+    assert did, "compaction should run even when user turns == KEEP_LAST_USER_TURNS"
+    assert agent.history[0].role == "system"
+    assert "历史摘要" in (agent.history[0].content or "")
+    assert agent.history[1].role == "user"
+    # One oldest user→assistant turn compacted into a summary head.
+    assert len(agent.history) == 11, f"unexpected length {len(agent.history)}"
+    print("  ok — compacted oldest turn while keeping recent context")
+
+
 # --------------------------------------------------------------------------
 # 3. Persistence: a turn snapshot survives a brand-new SessionManager.
 # --------------------------------------------------------------------------
@@ -321,6 +350,7 @@ async def test_persistence_list_content_round_trip():
 async def main():
     await test_compactor_prefix_summarised()
     await test_compactor_skipped_when_under_budget()
+    await test_compactor_six_turns_still_compacts()
     await test_persistence_round_trip()
     await test_persistence_debounced_fires()
     await test_persistence_list_content_round_trip()
