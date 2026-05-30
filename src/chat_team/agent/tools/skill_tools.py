@@ -19,7 +19,9 @@ role and isn't worth the complexity.
 """
 from __future__ import annotations
 
+import difflib
 import os
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,57 @@ def _allowed_skills_for_current_role(
     return [n for n in role.skills if skills.has(n)]
 
 
+def _clean_skill_name(raw: str) -> str:
+    """Normalize a model-produced skill token into a lookup candidate."""
+    s = unicodedata.normalize("NFKC", raw).strip()
+    # Common wrappers a model may include when copying from markdown.
+    while len(s) >= 2 and (
+        (s[0] == "`" and s[-1] == "`")
+        or (s[0] == "'" and s[-1] == "'")
+        or (s[0] == '"' and s[-1] == '"')
+        or (s[0] == "“" and s[-1] == "”")
+        or (s[0] == "‘" and s[-1] == "’")
+    ):
+        s = s[1:-1].strip()
+    # TOC copy/paste artifacts such as "- name: ...".
+    s = s.lstrip("-* ").strip()
+    return s
+
+
+def _resolve_skill_name_or_raise(raw_name: Any, skills: SkillRegistry) -> str:
+    """Resolve a user/model-provided name to a concrete registry key."""
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ToolError("name/skill must be a non-empty string")
+    if skills.has(raw_name):
+        return raw_name
+
+    cleaned = _clean_skill_name(raw_name)
+    if skills.has(cleaned):
+        return cleaned
+
+    # Support occasional "name: description" copies from the TOC.
+    split_candidates = [cleaned]
+    for sep in (":", "："):
+        if sep in cleaned:
+            split_candidates.append(cleaned.split(sep, 1)[0].strip())
+    for cand in split_candidates:
+        if skills.has(cand):
+            return cand
+
+    names = skills.names()
+    lowered = [n for n in names if n.casefold() == cleaned.casefold()]
+    if len(lowered) == 1:
+        return lowered[0]
+    if len(lowered) > 1:
+        raise ToolError(
+            f"skill 名称不唯一: {raw_name!r}; 请使用精确名称: {', '.join(sorted(lowered))}"
+        )
+
+    suggestions = difflib.get_close_matches(cleaned, names, n=3, cutoff=0.6)
+    hint = f"; maybe: {', '.join(suggestions)}" if suggestions else ""
+    raise ToolError(f"unknown skill: {raw_name}{hint}")
+
+
 class SkillTool(Tool):
     name = "skill"
     description = (
@@ -80,11 +133,7 @@ class SkillTool(Tool):
         }
 
     async def run(self, ctx: ToolContext, **kwargs: Any) -> str:
-        name = kwargs.get("name")
-        if not name or not isinstance(name, str):
-            raise ToolError("name must be a non-empty string")
-        if not self._skills.has(name):
-            raise ToolError(f"unknown skill: {name}")
+        name = _resolve_skill_name_or_raise(kwargs.get("name"), self._skills)
         allowed = _allowed_skills_for_current_role(ctx, self._roles, self._skills)
         if name not in allowed:
             raise ToolError(
@@ -94,6 +143,11 @@ class SkillTool(Tool):
         skill = self._skills.get(name)
         body = skill.body
         aux = _list_aux_files(skill.directory)
+        body = (
+            f"{body}\n\n"
+            f"[本 skill 目录] {skill.directory}\n"
+            "需要使用该 skill 自带脚本/资源文件时,请直接基于此目录路径操作,不要在系统目录中盲目搜索。"
+        )
         if aux:
             files_line = ", ".join(aux)
             body = (
@@ -130,12 +184,8 @@ class SkillReadFileTool(Tool):
         }
 
     async def run(self, ctx: ToolContext, **kwargs: Any) -> str:
-        skill_name = kwargs.get("skill")
+        skill_name = _resolve_skill_name_or_raise(kwargs.get("skill"), self._skills)
         rel = kwargs.get("path")
-        if not skill_name or not isinstance(skill_name, str):
-            raise ToolError("skill must be a non-empty string")
-        if not self._skills.has(skill_name):
-            raise ToolError(f"unknown skill: {skill_name}")
         allowed = _allowed_skills_for_current_role(ctx, self._roles, self._skills)
         if skill_name not in allowed:
             raise ToolError(

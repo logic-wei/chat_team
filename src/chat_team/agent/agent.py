@@ -100,13 +100,28 @@ class Agent:
         return []
 
     def _render_skills_block(self) -> str:
+        has_skill_tool = "skill" in set(self.role.tools)
         if not self.role.skills or self.skills is None:
             return ""
+        if not has_skill_tool:
+            # Role is misconfigured: it whitelists skills but cannot call the
+            # skill tool. Make the limitation explicit to prevent filesystem
+            # scavenging attempts (e.g. run_command + find /...).
+            return (
+                "[skills 配置异常]\n"
+                "当前角色声明了 skills,但 tools 未包含 skill,因此你无法读取任何 skill 正文。\n"
+                "不要通过 run_command/read_file 在文件系统中搜索 SKILL.md 或 ~/.chat_team/skills。"
+            )
         toc = self.skills.render_toc(self.role.skills)
         if not toc:
             return ""
         return (
-            "[可用 skills] (可调用 skill 工具按名加载正文,然后照其指引执行)\n" + toc
+            "[可用 skills]\n"
+            "只通过 skill(name=...) 按名字加载正文;需要辅助文件时用 "
+            "skill_read_file(skill=..., path=...)。\n"
+            "若 skill 含脚本/资源,以 skill() 返回中的 [本 skill 目录] 为准。\n"
+            "禁止使用 run_command/read_file 在系统目录中查找 skill 文件。\n"
+            + toc
         )
 
     # ---- main loop ---------------------------------------------------------

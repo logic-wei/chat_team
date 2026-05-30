@@ -148,6 +148,8 @@ async def test_system_prompt_injection() -> None:
     )
     body = agent._build_system_messages()[0].content or ""
     assert "[可用 skills]" in body, f"missing skills block:\n{body}"
+    assert "只通过 skill(name=...)" in body
+    assert "禁止使用 run_command/read_file" in body
     # Description should be first-line-only.
     assert "给 PR 写 checklist 式 review" in body
     assert "（多行说明）" not in body, "multi-line description was not truncated"
@@ -169,6 +171,28 @@ async def test_system_prompt_injection() -> None:
     print("  ✓ empty role.skills → no block")
 
 
+async def test_system_prompt_misconfigured_role_without_skill_tool() -> None:
+    print("== test 2b: role has skills but no skill tool => explicit misconfig warning ==")
+    home, settings = _setup("prompt-misconfig", role_skills=["pr_review"])
+    _write_skill(home, "pr_review", "给 PR 写 checklist 式 review", "正文")
+    skills = SkillRegistry.load(settings.paths.user_skills_dir)
+
+    sessions = SessionManager(settings)
+    sess = await sessions.get_or_create("sess-prompt-misconfig")
+    role = _make_role("test_role_misconfig", skills=["pr_review"], tools=["read_file", "run_command"])
+    sess.current_role = role.name
+
+    agent = Agent(
+        role=role, session=sess, settings=settings,
+        llm=CapturingLLM([]), tools=ToolRegistry(), skills=skills,
+    )
+    body = agent._build_system_messages()[0].content or ""
+    assert "[可用 skills]" not in body, "skills TOC should not be shown without skill tool"
+    assert "[skills 配置异常]" in body, f"missing misconfig warning:\n{body}"
+    assert "不要通过 run_command/read_file" in body
+    print("  ✓ misconfigured role gets explicit no-search warning")
+
+
 async def test_skill_tool_run() -> None:
     print("== test 3: SkillTool.run returns body, lists aux, gates on whitelist ==")
     home, settings = _setup("tool", role_skills=[])
@@ -186,8 +210,16 @@ async def test_skill_tool_run() -> None:
     ctx = ToolContext(cwd=sess.cwd, session=sess, settings=settings)
     out = await tool.run(ctx, name="pr_review")
     assert "## 流程" in out and "通览 diff" in out, f"body missing:\n{out}"
+    assert "[本 skill 目录]" in out, "skill directory hint missing"
+    assert str((home / "skills" / "pr_review").resolve()) in out
     assert "[本 skill 附带辅助文件]" in out, "aux files listing missing"
     assert "checklist.md" in out
+
+    # tolerant matching: quoted/space-padded and TOC-like value
+    out2 = await tool.run(ctx, name='  "pr_review"  ')
+    assert "## 流程" in out2
+    out3 = await tool.run(ctx, name="pr_review: 给 PR 写 checklist")
+    assert "## 流程" in out3
 
     # not in whitelist
     try:
@@ -227,6 +259,8 @@ async def test_skill_read_file() -> None:
 
     out = await tool.run(ctx, skill="pr_review", path="checklist.md")
     assert "边界值" in out, f"unexpected: {out}"
+    out_q = await tool.run(ctx, skill="'pr_review'", path="checklist.md")
+    assert "边界值" in out_q
     out2 = await tool.run(ctx, skill="pr_review", path="examples/good_pr.md")
     assert out2.strip() == "good example"
 
@@ -372,6 +406,7 @@ async def test_uv_missing_warn() -> None:
 async def main() -> None:
     await test_load_filters_malformed()
     await test_system_prompt_injection()
+    await test_system_prompt_misconfigured_role_without_skill_tool()
     await test_skill_tool_run()
     await test_skill_read_file()
     await test_compactor_unaffected()
