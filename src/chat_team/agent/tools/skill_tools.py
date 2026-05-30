@@ -143,10 +143,14 @@ class SkillTool(Tool):
         skill = self._skills.get(name)
         body = skill.body
         aux = _list_aux_files(skill.directory)
+        work_dir = ctx.cwd.resolve()
         body = (
             f"{body}\n\n"
             f"[本 skill 目录] {skill.directory}\n"
-            "需要使用该 skill 自带脚本/资源文件时,请直接基于此目录路径操作,不要在系统目录中盲目搜索。"
+            f"[当前会话工作目录] {work_dir}\n"
+            "需要使用该 skill 自带脚本/资源文件时,请直接基于 skill 目录路径操作,不要在系统目录中盲目搜索。\n"
+            "调用 skill 脚本时可切换到 skill 目录执行命令,但所有业务输入/输出文件路径"
+            "(如 --input/--output)必须指向当前会话工作目录及其子目录。"
         )
         if aux:
             files_line = ", ".join(aux)

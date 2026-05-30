@@ -85,8 +85,11 @@ class Agent:
             blocks.append(PYTHON_UV_CONVENTION)
         blocks.append("\n".join([
             f"[当前角色] {self.role.name} ({self.role.display_name})",
+            f"[当前工作目录] {self.session.cwd}",
             f"[团队记事本目录] {toc}",
             "[隔离规则] 你只看得到自己的对话历史;切换员工后,新同事看不到你的轨迹。",
+            "[路径规则] 业务输入/输出文件必须位于当前工作目录及其子目录;"
+            "调用 skill 脚本时可进入 skill 目录执行,但 --input/--output 仍必须指向当前工作目录内的文件。",
         ]))
         full = "\n\n".join(b for b in blocks if b).strip()
         msgs = [ChatMessage(role="system", content=full)]

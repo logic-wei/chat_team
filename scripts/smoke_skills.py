@@ -150,6 +150,8 @@ async def test_system_prompt_injection() -> None:
     assert "[可用 skills]" in body, f"missing skills block:\n{body}"
     assert "只通过 skill(name=...)" in body
     assert "禁止使用 run_command/read_file" in body
+    assert "[当前工作目录]" in body
+    assert "业务输入/输出文件必须位于当前工作目录及其子目录" in body
     # Description should be first-line-only.
     assert "给 PR 写 checklist 式 review" in body
     assert "（多行说明）" not in body, "multi-line description was not truncated"
@@ -211,6 +213,9 @@ async def test_skill_tool_run() -> None:
     out = await tool.run(ctx, name="pr_review")
     assert "## 流程" in out and "通览 diff" in out, f"body missing:\n{out}"
     assert "[本 skill 目录]" in out, "skill directory hint missing"
+    assert "[当前会话工作目录]" in out
+    assert str(sess.cwd.resolve()) in out
+    assert "--input/--output" in out
     assert str((home / "skills" / "pr_review").resolve()) in out
     assert "[本 skill 附带辅助文件]" in out, "aux files listing missing"
     assert "checklist.md" in out
