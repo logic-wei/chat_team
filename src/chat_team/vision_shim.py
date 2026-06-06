@@ -42,11 +42,11 @@ def resolve_vision_strategy(role: "Role", settings: "Settings") -> str:
             "invalid role.llm.vision_strategy=%r on role %s; using settings default",
             val, role.name,
         )
-    default = settings.llm.default_vision_strategy
+    default = settings.llm.vision.strategy
     if default in VALID_STRATEGIES:
         return default
     log.warning(
-        "invalid settings.llm.default_vision_strategy=%r; falling back to 'tool'",
+        "invalid settings.llm.vision.strategy=%r; falling back to 'tool'",
         default,
     )
     return "tool"

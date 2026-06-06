@@ -154,6 +154,7 @@ class Agent:
                     tools=self.tools.specs_for(self.role.tools),
                     model=self._model(),
                     temperature=self._temperature(),
+                    reasoning_effort=self._reasoning_effort(),
                     image_detail=self._image_detail(),
                     image_base_dir=self.session.cwd,
                     session_id=self.session.session_id,
@@ -228,15 +229,19 @@ class Agent:
     # ---- model resolution --------------------------------------------------
 
     def _model(self) -> str:
-        return self.role.llm.model or self.settings.llm.default_model
+        return self.role.llm.model or self.settings.llm.chat.model
 
     def _temperature(self) -> float:
         if self.role.llm.temperature is None:
-            return self.settings.llm.default_temperature
+            return self.settings.llm.chat.temperature
         return self.role.llm.temperature
+
+    def _reasoning_effort(self) -> str | None:
+        val = (self.settings.llm.chat.reasoning_effort or "").strip()
+        return val or None
 
     def _image_detail(self) -> str:
         return (
             self.role.llm.image_detail
-            or self.settings.llm.default_image_detail
+            or self.settings.llm.vision.image_detail
         )

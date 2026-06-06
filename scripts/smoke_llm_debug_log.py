@@ -114,6 +114,7 @@ def test_write_call_log_creates_file_and_increments_seq() -> None:
         model="gpt-4o-mini",
         temperature=0.3,
         max_tokens=None,
+        reasoning_effort=None,
         tool_names=["read_file", "write_file"],
         messages_payload=payload,
         response_message=response_msg,
@@ -129,7 +130,7 @@ def test_write_call_log_creates_file_and_increments_seq() -> None:
     record = json.loads(p1.read_text(encoding="utf-8"))
     expected_keys = {
         "session_id", "role_name", "call_kind", "timestamp_utc",
-        "model", "temperature", "max_tokens", "tools",
+        "model", "temperature", "max_tokens", "reasoning_effort", "tools",
         "messages", "response", "finish_reason", "usage",
         "latency_ms", "error",
     }
@@ -149,6 +150,7 @@ def test_write_call_log_creates_file_and_increments_seq() -> None:
         model="gpt-4o-mini",
         temperature=0.3,
         max_tokens=None,
+        reasoning_effort=None,
         tool_names=[],
         messages_payload=payload,
         response_message=response_msg,
@@ -168,6 +170,7 @@ def test_write_call_log_creates_file_and_increments_seq() -> None:
         model="gpt-4o-mini",
         temperature=0.0,
         max_tokens=None,
+        reasoning_effort=None,
         tool_names=[],
         messages_payload=payload,
         response_message=response_msg,
@@ -191,6 +194,7 @@ def test_write_call_log_error_path() -> None:
         model="gpt-4o-mini",
         temperature=0.3,
         max_tokens=None,
+        reasoning_effort=None,
         tool_names=[],
         messages_payload=[{"role": "user", "content": "boom"}],
         response_message=None,
@@ -221,6 +225,7 @@ def test_write_call_log_swallow_io_failure() -> None:
         model="m",
         temperature=0.0,
         max_tokens=None,
+        reasoning_effort=None,
         tool_names=[],
         messages_payload=[],
         response_message=None,

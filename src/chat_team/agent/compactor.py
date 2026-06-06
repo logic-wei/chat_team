@@ -117,6 +117,7 @@ async def _summarize(
         ],
         model=model,
         temperature=0.0,
+        reasoning_effort=(agent.settings.llm.chat.reasoning_effort or "").strip() or None,
         session_id=agent.session.session_id,
         role_name=agent.role.name,
         call_kind="compactor",
@@ -130,7 +131,7 @@ async def maybe_compact(agent: "Agent", llm: LLMProvider) -> bool:
     """If history exceeds budget, summarize the prefix in place. Returns True iff compaction ran."""
     budget = (
         agent.role.llm.history_token_budget
-        or agent.settings.llm.default_history_token_budget
+        or agent.settings.llm.chat.history_token_budget
     )
     if budget <= 0:
         return False
@@ -151,7 +152,7 @@ async def maybe_compact(agent: "Agent", llm: LLMProvider) -> bool:
     if not prefix:
         return False
 
-    model = agent.role.llm.model or agent.settings.llm.default_model
+    model = agent.role.llm.model or agent.settings.llm.chat.model
     try:
         summary = await _summarize(prefix, llm, model, agent=agent)
     except Exception:                                         # noqa: BLE001

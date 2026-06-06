@@ -28,10 +28,16 @@ tools:
 
 llm:
   provider: openai                   # only "openai" supported in v1
-  default_model: gpt-4o-mini
-  default_temperature: 0.3
-  default_history_token_budget: 12000  # per-role; tighter values trigger compaction sooner
-  default_image_detail: high         # vision tile granularity: low | high | auto. high ≈ 1600 tokens / 1024² image — bump history budget if you keep many images in context, or set "low" per-role.
+  chat:
+    model: gpt-4o-mini
+    temperature: 0.3
+    history_token_budget: 12000      # per-role; tighter values trigger compaction sooner
+    reasoning_effort: ""             # optional: low | medium | high (empty = provider/model default)
+  vision:
+    model: ""                        # empty = reuse llm.chat.model
+    strategy: tool                   # tool | direct
+    image_detail: high               # vision tile granularity: low | high | auto
+    reasoning_effort: ""             # optional: low | medium | high (empty = provider/model default)
   debug_log_enabled: false           # write one JSON per LLM call to <workspace>/.chat_team/llm/. base64 image data is redacted. OFF in production — turn on only for local debugging; one file per call piles up fast.
   http_debug_log_enabled: false      # write JSON logs for LLM HTTP requests + responses to <workspace>/.chat_team/llm_http/ with full headers+body (no redaction). OFF in production; contains sensitive data.
   use_streaming: true                # use provider-side streaming and assemble the final answer from chunks; helps avoid read-timeout failures on slow first-token responses.

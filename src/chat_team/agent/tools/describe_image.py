@@ -48,6 +48,7 @@ async def _describe_one(
     *,
     prompt: str,
     detail: str,
+    reasoning_effort: str | None = None,
     llm: LLMProvider,
     model: str,
     image_base_dir: str,
@@ -73,6 +74,7 @@ async def _describe_one(
         ],
         model=model,
         temperature=0.0,
+        reasoning_effort=reasoning_effort,
         image_detail=detail,
         image_base_dir=image_base_dir,
         session_id=session_id,
@@ -97,6 +99,7 @@ async def describe_images(
     *,
     prompt: str,
     detail: str,
+    reasoning_effort: str | None = None,
     llm: LLMProvider,
     model: str,
     image_base_dir: str,
@@ -125,6 +128,7 @@ async def describe_images(
                 path,
                 prompt=prompt,
                 detail=detail,
+                reasoning_effort=reasoning_effort,
                 llm=llm,
                 model=model,
                 image_base_dir=image_base_dir,
@@ -193,16 +197,18 @@ class DescribeImageTool(Tool):
         prompt = kwargs.get("prompt") or DEFAULT_TOOL_PROMPT
         if not isinstance(prompt, str):
             raise ToolError("prompt must be a string")
-        detail = kwargs.get("detail") or "high"
+        detail = kwargs.get("detail") or ctx.settings.llm.vision.image_detail
         if detail not in ("low", "high", "auto"):
             raise ToolError("detail must be one of low|high|auto")
 
-        model = ctx.settings.llm.default_vision_model or ctx.settings.llm.default_model
+        model = ctx.settings.llm.vision.model or ctx.settings.llm.chat.model
+        reasoning_effort = (ctx.settings.llm.vision.reasoning_effort or "").strip() or None
 
         descriptions = await describe_images(
             abs_paths,
             prompt=prompt,
             detail=detail,
+            reasoning_effort=reasoning_effort,
             llm=llm,
             model=model,
             image_base_dir=str(ctx.cwd),

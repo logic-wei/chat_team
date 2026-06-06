@@ -63,16 +63,8 @@ class CleanupConfig:
 @dataclass
 class LLMConfig:
     provider: str = "openai"
-    default_model: str = "gpt-4o-mini"
-    default_temperature: float = 0.3
-    default_history_token_budget: int = 12000
-    default_image_detail: str = "high"   # "low" | "high" | "auto"; consulted when role doesn't set image_detail
-    # Vision handling strategy: "tool" turns inbound images into placeholders
-    # (no pre-OCR); "direct" hands raw image blocks to the provider.
-    default_vision_strategy: str = "tool"
-    # Optional override for the model used by the describe_image tool.
-    # Empty → reuse default_model.
-    default_vision_model: str = ""
+    chat: "LLMChatConfig" = field(default_factory=lambda: LLMChatConfig())
+    vision: "LLMVisionConfig" = field(default_factory=lambda: LLMVisionConfig())
     # When true, every OpenAI provider call writes a JSON file to
     # <workspace>/.chat_team/llm/ recording the request payload (with
     # base64 image data URIs redacted), the response, token usage, and
@@ -107,6 +99,53 @@ class LLMConfig:
     # write script → `uv run` → re-read failure → fix deps → re-run → …)
     # routinely need more than the previous fixed cap of 8.
     max_tool_loops_per_turn: int = 16
+
+    # ---- backward-compatible aliases (for existing call sites/tests) ----
+    @property
+    def default_model(self) -> str:
+        return self.chat.model
+
+    @property
+    def default_temperature(self) -> float:
+        return self.chat.temperature
+
+    @property
+    def default_history_token_budget(self) -> int:
+        return self.chat.history_token_budget
+
+    @property
+    def default_image_detail(self) -> str:
+        return self.vision.image_detail
+
+    @property
+    def default_vision_strategy(self) -> str:
+        return self.vision.strategy
+
+    @property
+    def default_vision_model(self) -> str:
+        return self.vision.model
+
+
+@dataclass
+class LLMChatConfig:
+    model: str = "gpt-4o-mini"
+    temperature: float = 0.3
+    history_token_budget: int = 12000
+    # Optional reasoning depth for chat turns. Keep empty to let provider/model
+    # defaults decide.
+    reasoning_effort: str = ""
+
+
+@dataclass
+class LLMVisionConfig:
+    # Empty means "reuse chat model".
+    model: str = ""
+    # Vision handling strategy: "tool" converts images to placeholders;
+    # "direct" passes image blocks to the provider.
+    strategy: str = "tool"
+    image_detail: str = "high"            # "low" | "high" | "auto"
+    # Optional reasoning depth for vision calls (describe_image, OCR-ish flows).
+    reasoning_effort: str = ""
 
 
 @dataclass
@@ -168,7 +207,42 @@ def load_settings(paths: Paths | None = None) -> Settings:
     if isinstance(raw.get("tools"), dict):
         _coerce(settings.tools, raw["tools"])
     if isinstance(raw.get("llm"), dict):
-        _coerce(settings.llm, raw["llm"])
+        llm_raw = raw["llm"]
+        assert isinstance(llm_raw, dict)
+        # Shared llm runtime knobs (provider/retry/timeout/debug/etc).
+        _coerce(settings.llm, {
+            k: v for k, v in llm_raw.items()
+            if k not in {
+                "chat", "vision",
+                # legacy flat aliases handled below
+                "default_model", "default_temperature", "default_history_token_budget",
+                "default_vision_model", "default_image_detail", "default_vision_strategy",
+                "default_chat_reasoning_effort", "default_vision_reasoning_effort",
+            }
+        })
+        # Legacy flat keys (backward compatibility).
+        if "default_model" in llm_raw:
+            settings.llm.chat.model = llm_raw["default_model"]
+        if "default_temperature" in llm_raw:
+            settings.llm.chat.temperature = llm_raw["default_temperature"]
+        if "default_history_token_budget" in llm_raw:
+            settings.llm.chat.history_token_budget = llm_raw["default_history_token_budget"]
+        if "default_vision_model" in llm_raw:
+            settings.llm.vision.model = llm_raw["default_vision_model"]
+        if "default_image_detail" in llm_raw:
+            settings.llm.vision.image_detail = llm_raw["default_image_detail"]
+        if "default_vision_strategy" in llm_raw:
+            settings.llm.vision.strategy = llm_raw["default_vision_strategy"]
+        if "default_chat_reasoning_effort" in llm_raw:
+            settings.llm.chat.reasoning_effort = llm_raw["default_chat_reasoning_effort"]
+        if "default_vision_reasoning_effort" in llm_raw:
+            settings.llm.vision.reasoning_effort = llm_raw["default_vision_reasoning_effort"]
+
+        # New nested layout: llm.chat / llm.vision.
+        if isinstance(llm_raw.get("chat"), dict):
+            _coerce(settings.llm.chat, llm_raw["chat"])
+        if isinstance(llm_raw.get("vision"), dict):
+            _coerce(settings.llm.vision, llm_raw["vision"])
     if isinstance(raw.get("logging"), dict):
         _coerce(settings.logging, raw["logging"])
     if isinstance(raw.get("cleanup"), dict):

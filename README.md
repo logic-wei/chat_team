@@ -66,6 +66,22 @@ OPENAI_BASE_URL=https://api.openai.com/v1   # 替换成内部代理 / vLLM / Oll
 
 测试时可用 `CHAT_TEAM_HOME=/tmp/chat_team_dev` 把整个根目录搬走,避免污染真实环境。
 
+`config.yaml` 中模型相关配置已拆分为两组:
+
+```yaml
+llm:
+  chat:
+    model: gpt-4o-mini
+    temperature: 0.3
+    history_token_budget: 12000
+    reasoning_effort: ""   # low | medium | high,留空=模型默认
+  vision:
+    model: ""              # 空=复用 chat.model
+    strategy: tool         # tool | direct
+    image_detail: high
+    reasoning_effort: ""   # low | medium | high,留空=模型默认
+```
+
 ### 大模型调用调试日志
 
 排查"工具路由错了 / compactor 摘要变样 / 视觉 OCR 返回奇怪结果"这类问题时,光看
@@ -79,7 +95,7 @@ OPENAI_BASE_URL=https://api.openai.com/v1   # 替换成内部代理 / vLLM / Oll
 
 `kind` 三种:`agent`(角色主轮)/ `compactor`(压缩调用)/ `vision`(图片 OCR shim 和
 `describe_image` 工具)。每条记录包含 `messages` / `tools` / `model` / `temperature` /
-`response` / `finish_reason` / `usage`(token 用量)/ `latency_ms`,失败时多一项
+`reasoning_effort` / `response` / `finish_reason` / `usage`(token 用量)/ `latency_ms`,失败时多一项
 `error=repr(exc)`、`response=null`。
 
 - **图片 base64 自动脱敏**为 `[redacted: <mime> <字节数> bytes]`,日志可以放心 grep。

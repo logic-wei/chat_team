@@ -47,6 +47,8 @@ class CompletionRequest:
     model: str = ""
     temperature: float = 0.3
     max_tokens: int | None = None
+    # Optional reasoning depth (for models/providers that support it).
+    reasoning_effort: str | None = None
     image_detail: str | None = None  # "low" | "high" | "auto"; provider applies to every image block
     image_base_dir: Any | None = None  # base for resolving relative image paths (typically session.cwd)
     # Optional debug-log context. When ``debug_log_dir`` is set AND the

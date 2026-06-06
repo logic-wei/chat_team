@@ -10,14 +10,14 @@ import yaml
 
 @dataclass
 class RoleLLMConfig:
-    model: str = ""                      # falls back to settings.llm.default_model
-    temperature: float | None = None     # falls back to settings.llm.default_temperature
+    model: str = ""                      # falls back to settings.llm.chat.model
+    temperature: float | None = None     # falls back to settings.llm.chat.temperature
     history_token_budget: int | None = None
-    image_detail: str | None = None      # "low" | "high" | "auto"; falls back to settings.llm.default_image_detail
+    image_detail: str | None = None      # "low" | "high" | "auto"; falls back to settings.llm.vision.image_detail
     # "tool" → inbound images become placeholder text blocks (no pre-OCR).
     # "direct" → pass image blocks straight to the provider (high-fidelity
     # multi-turn visual chat).
-    # None → fall back to settings.llm.default_vision_strategy.
+    # None → fall back to settings.llm.vision.strategy.
     vision_strategy: str | None = None
 
 

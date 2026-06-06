@@ -46,6 +46,14 @@ _RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
 )
 
 
+def _supports_reasoning_effort(model: str) -> bool:
+    m = (model or "").lower().strip()
+    return (
+        m.startswith(("o1", "o3", "o4", "gpt-5"))
+        or "reason" in m
+    )
+
+
 @dataclass
 class _HttpLogContext:
     dir_path: Path
@@ -374,6 +382,9 @@ class OpenAIChatCompletionProvider(LLMProvider):
             kwargs["tools"] = _to_openai_tools(request.tools)
         if request.max_tokens:
             kwargs["max_tokens"] = request.max_tokens
+        effort = (request.reasoning_effort or "").strip()
+        if effort and _supports_reasoning_effort(request.model):
+            kwargs["reasoning_effort"] = effort
 
         t0 = time.monotonic()
         attempts = 0
@@ -560,6 +571,7 @@ class OpenAIChatCompletionProvider(LLMProvider):
             model=request.model,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
+            reasoning_effort=request.reasoning_effort,
             tool_names=[s.name for s in request.tools],
             messages_payload=messages_payload,
             response_message=response_message,
