@@ -83,6 +83,44 @@ def build_llm_provider(settings: Settings) -> LLMProvider:
     )
 
 
+def build_vision_llm_provider(settings: Settings, main_llm: LLMProvider) -> LLMProvider:
+    """Return an LLM provider for vision/OCR calls.
+
+    Credentials are read exclusively from environment variables, consistent
+    with how the main provider reads OPENAI_API_KEY / OPENAI_BASE_URL from .env:
+
+      OPENAI_VISION_API_KEY  — vision API key; falls back to OPENAI_API_KEY
+      OPENAI_VISION_BASE_URL — vision base URL; falls back to OPENAI_BASE_URL
+
+    When the resolved vision credentials are identical to the main provider's,
+    ``main_llm`` is returned as-is to avoid duplicate connections.
+    """
+    main_api_key = os.environ.get("OPENAI_API_KEY", "")
+    main_base_url = os.environ.get("OPENAI_BASE_URL") or None
+
+    vision_api_key = os.environ.get("OPENAI_VISION_API_KEY", "") or main_api_key
+    vision_base_url = (os.environ.get("OPENAI_VISION_BASE_URL", "") or main_base_url) or None
+
+    # Reuse the main provider when credentials are identical — no extra connections.
+    if vision_api_key == main_api_key and vision_base_url == main_base_url:
+        return main_llm
+
+    log.info(
+        "vision LLM uses separate credentials (base_url=%s)",
+        vision_base_url or "(default)",
+    )
+    return OpenAIChatCompletionProvider(
+        api_key=vision_api_key,
+        base_url=vision_base_url,
+        debug_log_enabled=settings.llm.debug_log_enabled,
+        http_debug_log_enabled=settings.llm.http_debug_log_enabled,
+        use_streaming=settings.llm.use_streaming,
+        request_timeout_seconds=settings.llm.request_timeout_seconds,
+        max_retries=settings.llm.max_retries,
+        retry_initial_delay=settings.llm.retry_initial_delay,
+    )
+
+
 def warn_if_uv_missing(roles: RoleRegistry) -> None:
     """WARN when a Python-capable role is loaded but `uv` isn't on PATH.
 
@@ -108,9 +146,11 @@ def build_dispatcher(settings: Settings) -> Dispatcher:
     persistence = PersistenceManager(settings)
     sessions = SessionManager(settings, persistence=persistence)
     llm = build_llm_provider(settings)
+    vision_llm = build_vision_llm_provider(settings, llm)
     return Dispatcher(
         settings, sessions, roles, tools, llm,
         skills=skills, persistence=persistence,
+        vision_llm=vision_llm,
     )
 
 

@@ -175,8 +175,9 @@ class DescribeImageTool(Tool):
     }
 
     async def run(self, ctx: ToolContext, **kwargs: Any) -> str:
-        if ctx.llm is None:
+        if ctx.llm is None and ctx.vision_llm is None:
             raise ToolError("describe_image requires an LLM provider in ToolContext")
+        llm = ctx.vision_llm or ctx.llm
         raw_paths = kwargs.get("paths")
         if not isinstance(raw_paths, list) or not raw_paths:
             raise ToolError("paths must be a non-empty list of strings")
@@ -204,7 +205,7 @@ class DescribeImageTool(Tool):
             abs_paths,
             prompt=prompt,
             detail=detail,
-            llm=ctx.llm,
+            llm=llm,
             model=model,
             image_base_dir=str(ctx.cwd),
             session_id=ctx.session.session_id,

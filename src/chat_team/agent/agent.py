@@ -60,6 +60,7 @@ class Agent:
     llm: LLMProvider
     tools: ToolRegistry
     skills: "SkillRegistry | None" = None
+    vision_llm: LLMProvider | None = None
     history: list[ChatMessage] = field(default_factory=list)
     pending_system_inject: list[str] = field(default_factory=list)
 
@@ -220,6 +221,7 @@ class Agent:
             settings=self.settings,
             stream=stream,
             llm=self.llm,
+            vision_llm=self.vision_llm,
         )
         return await tool.run(ctx, **(call.arguments or {}))
 

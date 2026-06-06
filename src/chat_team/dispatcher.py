@@ -34,6 +34,7 @@ class Dispatcher:
         llm: LLMProvider,
         skills: SkillRegistry | None = None,
         persistence: PersistenceManager | None = None,
+        vision_llm: LLMProvider | None = None,
     ):
         self.settings = settings
         self.sessions = sessions
@@ -42,6 +43,9 @@ class Dispatcher:
         self.llm = llm
         self.skills = skills if skills is not None else SkillRegistry({})
         self.persistence = persistence
+        # Separate provider for vision/OCR calls (eager shim + describe_image tool).
+        # Falls back to self.llm when not set.
+        self._vision_llm = vision_llm
 
     async def handle(self, msg: IncomingMessage, stream: StreamHandle) -> None:
         session = await self.sessions.get_or_create(msg.session_id)
@@ -150,7 +154,7 @@ class Dispatcher:
                 original_content,
                 role=agent.role,
                 settings=self.settings,
-                llm=self.llm,
+                llm=self._vision_llm or self.llm,
                 cwd=session.cwd,
                 session_id=session.session_id,
             )
@@ -213,6 +217,7 @@ class Dispatcher:
             llm=self.llm,
             tools=self.tools,
             skills=self.skills,
+            vision_llm=self._vision_llm,
         )
         # First time we materialise this role for the session — adopt any
         # history loaded from disk and consume it (one-shot).
