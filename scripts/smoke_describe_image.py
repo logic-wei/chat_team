@@ -6,6 +6,7 @@
 * Missing file / oversize file → "[读取失败]" without an LLM call
 * DescribeImageTool sandbox rejects absolute paths and ../
 * DescribeImageTool formats results as "[图:rel]\\n<desc>" sections
+* DescribeImageTool allows up to 16 paths and rejects 17+
 """
 from __future__ import annotations
 
@@ -222,13 +223,19 @@ async def test_tool_sandbox_and_format():
         assert len(llm.calls) == 1
         print("  ✓ relative path produces formatted result:", repr(result[:60]))
 
-        # 5 paths → cap rejected
+        # 16 paths accepted (batch upper bound)
+        result16 = await tool.run(ctx, paths=["./inbox/a.png"] * 16)
+        assert result16.count("[图:./inbox/a.png]") == 16, result16
+        # repeated same path should be served by cache after first scan
+        assert len(llm.calls) == 1, "batch call should reuse cache for repeated image path"
+
+        # 17 paths → cap rejected
         try:
-            await tool.run(ctx, paths=["./inbox/a.png"] * 5)
+            await tool.run(ctx, paths=["./inbox/a.png"] * 17)
         except ToolError as e:
-            print("  ✓ >4 paths rejected:", e)
+            print("  ✓ >16 paths rejected:", e)
         else:
-            raise AssertionError(">4 paths must be rejected")
+            raise AssertionError(">16 paths must be rejected")
 
 
 async def main():

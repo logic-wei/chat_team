@@ -1,11 +1,11 @@
-"""Smoke test for the eager vision shim (apply_vision_strategy).
+"""Smoke test for the vision shim (apply_vision_strategy).
 
-* tool mode + [text, image] → flat string with "[图:rel]\\n<desc>"; calls LLM once
+* tool mode + [text, image] → flat string with "[图:rel]" placeholder, no LLM call
 * tool mode + plain string → unchanged, no LLM call
 * tool mode + text-only list → flattened to string, no LLM call
 * direct mode + [text, image] → list returned unchanged, no LLM call
 * role.llm.vision_strategy overrides settings.llm.default_vision_strategy
-* Cache reuse across calls: [A, B] then [A, C] → A is OCR'd once
+* repeated tool-mode calls never invoke LLM
 """
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ from chat_team.llm.base import (
     CompletionResponse,
     LLMProvider,
 )
-from chat_team.llm.image_description_cache import ImageDescriptionCache
 from chat_team.roles.config import Role, RoleLLMConfig
 from chat_team.vision_shim import apply_vision_strategy, resolve_vision_strategy
 
@@ -85,18 +84,11 @@ def _role(name: str, vs: str | None = None) -> Role:
     )
 
 
-def _fresh_cache_module():
-    """Reset the module-level default cache so each test starts clean."""
-    import chat_team.llm.image_description_cache as m
-    m._DEFAULT_CACHE = ImageDescriptionCache()
-
-
 async def test_tool_mode_image_block_replaced():
-    print("== test 1: tool mode replaces image block with [图:rel]\\n<desc> ==")
+    print("== test 1: tool mode replaces image block with [图:rel] ==")
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         _make_image(d / "inbox", "a.png")
-        _fresh_cache_module()
         settings = load_settings()
         role = _role("admin")  # no per-role override → settings default = "tool"
         llm = CountingLLM()
@@ -110,14 +102,13 @@ async def test_tool_mode_image_block_replaced():
         assert isinstance(out, str), f"expected str, got {type(out)}"
         assert "看这个" in out
         assert "[图:./inbox/a.png]" in out
-        assert "OCR-a.png-0" in out
-        assert len(llm.calls) == 1
+        assert "OCR-a.png-0" not in out
+        assert len(llm.calls) == 0
         print("  ✓ result:", repr(out))
 
 
 async def test_tool_mode_plain_string_passthrough():
     print("== test 2: tool mode + plain string passthrough ==")
-    _fresh_cache_module()
     settings = load_settings()
     role = _role("admin")
     llm = CountingLLM()
@@ -131,7 +122,6 @@ async def test_tool_mode_plain_string_passthrough():
 
 async def test_tool_mode_text_only_list_flattens():
     print("== test 3: tool mode + text-only list flattens to string ==")
-    _fresh_cache_module()
     settings = load_settings()
     role = _role("admin")
     llm = CountingLLM()
@@ -153,7 +143,6 @@ async def test_direct_mode_passes_through_unchanged():
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         _make_image(d / "inbox", "a.png")
-        _fresh_cache_module()
         settings = load_settings()
         role = _role("vision_role", vs="direct")
         llm = CountingLLM()
@@ -185,14 +174,13 @@ async def test_role_overrides_settings_default():
     print("  ✓ role override + invalid fallback both work")
 
 
-async def test_cache_reuse_across_calls():
-    print("== test 6: [A, B] then [A, C] → A is OCR'd once across calls ==")
+async def test_repeated_tool_mode_never_calls_llm():
+    print("== test 6: repeated tool-mode calls never invoke LLM ==")
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         _make_image(d / "inbox", "a.png", payload_extra=b"\xaa")
         _make_image(d / "inbox", "b.png", payload_extra=b"\xbb")
         _make_image(d / "inbox", "c.png", payload_extra=b"\xcc")
-        _fresh_cache_module()
         settings = load_settings()
         role = _role("admin")
         llm = CountingLLM()
@@ -205,8 +193,8 @@ async def test_cache_reuse_across_calls():
             ],
             role=role, settings=settings, llm=llm, cwd=d,
         )
-        assert "OCR-a.png" in out1 and "OCR-b.png" in out1
-        assert len(llm.calls) == 2
+        assert "[图:./inbox/a.png]" in out1 and "[图:./inbox/b.png]" in out1
+        assert len(llm.calls) == 0
 
         out2 = await apply_vision_strategy(
             [
@@ -216,11 +204,9 @@ async def test_cache_reuse_across_calls():
             ],
             role=role, settings=settings, llm=llm, cwd=d,
         )
-        # A should have been cached → only C triggers a new call (3 total)
-        assert len(llm.calls) == 3, f"expected 3 LLM calls total, got {len(llm.calls)}"
-        # The cached A description should still appear in the output
-        assert "OCR-a.png" in out2 and "OCR-c.png" in out2
-        print("  ✓ A cached across calls (total 3 LLM calls for 3 unique images)")
+        assert "[图:./inbox/a.png]" in out2 and "[图:./inbox/c.png]" in out2
+        assert len(llm.calls) == 0
+        print("  ✓ no pre-OCR call happened in either turn")
 
 
 async def main():
@@ -229,7 +215,7 @@ async def main():
     await test_tool_mode_text_only_list_flattens()
     await test_direct_mode_passes_through_unchanged()
     await test_role_overrides_settings_default()
-    await test_cache_reuse_across_calls()
+    await test_repeated_tool_mode_never_calls_llm()
     print("\nALL VISION_SHIM SMOKE TESTS PASSED")
 
 

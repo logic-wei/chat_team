@@ -1,19 +1,9 @@
-"""Vision-as-tool: turn an image into text via an LLM call.
+"""Vision-as-tool: turn workspace images into text via an LLM call.
 
-Two callers:
-
-* The eager vision shim (``runtime.vision_shim``) calls :func:`describe_images`
-  on inbound user-message images so ``agent.history`` only ever sees a text
-  rendering. Same image + prompt + detail + model is OCR'd at most once per
-  process thanks to :class:`ImageDescriptionCache`.
-
-* The agent itself can call :class:`DescribeImageTool` to re-query an image
-  with a different prompt (e.g. "把图 2 的表格转成 Markdown"), a higher
-  detail, or simply because the eager pass missed something.
-
-The function is deliberately **independent of ToolContext** so the shim can
-use it without faking a tool invocation. The tool wrapper is a thin shell
-that handles sandbox validation and pulls the LLM provider from ``ctx.llm``.
+The agent can call :class:`DescribeImageTool` to inspect one or more images
+it already sees as placeholders in chat history (for example ``[图:./inbox/x]``).
+Same image + prompt + detail + model is OCR'd at most once per process thanks
+to :class:`ImageDescriptionCache`.
 """
 from __future__ import annotations
 
@@ -35,6 +25,8 @@ DEFAULT_TOOL_PROMPT = (
     "请详细描述这张图片的内容,包括其中的可见文字(若有)以及画面要素。"
     "对文字部分尽量原样转写,不要总结、不要翻译。"
 )
+MAX_IMAGES_PER_CALL = 16
+DEFAULT_DESCRIBE_CONCURRENCY = 8
 
 
 def _read_failure_reason(abs_path: str) -> str | None:
@@ -109,35 +101,40 @@ async def describe_images(
     model: str,
     image_base_dir: str,
     cache: ImageDescriptionCache | None = None,
+    max_concurrency: int = DEFAULT_DESCRIBE_CONCURRENCY,
     session_id: str | None = None,
     role_name: str | None = None,
     debug_log_dir: Path | None = None,
 ) -> list[str]:
     """Describe a batch of images, returning one description per input path
-    in the same order. Each image is its own concurrent LLM call so a single
-    bad image doesn't poison the rest, and the cache makes repeats free.
+    in the same order. Each image is its own LLM call (bounded concurrency)
+    so a single bad image doesn't poison the rest, and the cache makes repeats
+    free.
 
     ``paths`` are expected to be **absolute** and already sandbox-validated.
     """
     if not paths:
         return []
     cache = cache or default_cache()
-    coros = [
-        _describe_one(
-            p,
-            prompt=prompt,
-            detail=detail,
-            llm=llm,
-            model=model,
-            image_base_dir=image_base_dir,
-            cache=cache,
-            session_id=session_id,
-            role_name=role_name,
-            debug_log_dir=debug_log_dir,
-        )
-        for p in paths
-    ]
-    return await asyncio.gather(*coros)
+    limit = max(1, min(int(max_concurrency), len(paths)))
+    sem = asyncio.Semaphore(limit)
+
+    async def _run_one(path: str) -> str:
+        async with sem:
+            return await _describe_one(
+                path,
+                prompt=prompt,
+                detail=detail,
+                llm=llm,
+                model=model,
+                image_base_dir=image_base_dir,
+                cache=cache,
+                session_id=session_id,
+                role_name=role_name,
+                debug_log_dir=debug_log_dir,
+            )
+
+    return await asyncio.gather(*(_run_one(p) for p in paths))
 
 
 class DescribeImageTool(Tool):
@@ -146,7 +143,8 @@ class DescribeImageTool(Tool):
         "对工作区里的图片调用视觉模型生成文字描述/OCR 结果。"
         "适合在 agent 已经看到 [图:path] 占位但默认摘要不够,"
         "想要换一个 prompt 再问、或者用更高的 detail 重新扫描时使用。"
-        "只接受相对当前工作目录的路径(例如 ./inbox/xxx.jpg);一次最多 4 张。"
+        "只接受相对当前工作目录的路径(例如 ./inbox/xxx.jpg);"
+        "支持多图并发,一次最多 16 张。"
     )
     parameters = {
         "type": "object",
@@ -154,9 +152,9 @@ class DescribeImageTool(Tool):
             "paths": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "1 到 4 个相对工作目录的图片路径",
+                "description": "1 到 16 个相对工作目录的图片路径",
                 "minItems": 1,
-                "maxItems": 4,
+                "maxItems": MAX_IMAGES_PER_CALL,
             },
             "prompt": {
                 "type": "string",
@@ -181,8 +179,8 @@ class DescribeImageTool(Tool):
         raw_paths = kwargs.get("paths")
         if not isinstance(raw_paths, list) or not raw_paths:
             raise ToolError("paths must be a non-empty list of strings")
-        if len(raw_paths) > 4:
-            raise ToolError("paths supports at most 4 images per call")
+        if len(raw_paths) > MAX_IMAGES_PER_CALL:
+            raise ToolError(f"paths supports at most {MAX_IMAGES_PER_CALL} images per call")
         rel_paths: list[str] = []
         abs_paths: list[str] = []
         for rel in raw_paths:
@@ -208,6 +206,7 @@ class DescribeImageTool(Tool):
             llm=llm,
             model=model,
             image_base_dir=str(ctx.cwd),
+            max_concurrency=min(DEFAULT_DESCRIBE_CONCURRENCY, len(abs_paths)),
             session_id=ctx.session.session_id,
             role_name=ctx.session.current_role,
             debug_log_dir=ctx.cwd / ".chat_team" / "llm",

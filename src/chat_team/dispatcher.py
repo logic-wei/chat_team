@@ -43,7 +43,7 @@ class Dispatcher:
         self.llm = llm
         self.skills = skills if skills is not None else SkillRegistry({})
         self.persistence = persistence
-        # Separate provider for vision/OCR calls (eager shim + describe_image tool).
+        # Separate provider for vision/OCR calls (describe_image tool).
         # Falls back to self.llm when not set.
         self._vision_llm = vision_llm
 
@@ -148,8 +148,7 @@ class Dispatcher:
             self._apply_pending_handoff(agent, session)
             # Apply the *current* role's vision strategy to the *original*
             # user content. On transfer, the new role re-evaluates the same
-            # raw image blocks under its own strategy (and shares the eager
-            # description cache, so re-OCR is essentially free).
+            # raw image blocks under its own strategy.
             transformed = await apply_vision_strategy(
                 original_content,
                 role=agent.role,

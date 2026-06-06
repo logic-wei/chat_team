@@ -2,7 +2,7 @@
 
 Sibling to :mod:`image_cache`, but stores the **textual description** that
 falls out of a vision LLM call rather than the raw base64 data URI. The
-eager vision shim and the ``describe_image`` tool both consult this cache
+``describe_image`` tool (and any future vision helpers) consult this cache
 so a given image+prompt+detail+model is OCR'd at most once per process.
 
 The cache key includes ``mtime_ns`` and ``size`` so a rewritten file

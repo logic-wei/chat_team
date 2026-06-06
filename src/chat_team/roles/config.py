@@ -14,9 +14,9 @@ class RoleLLMConfig:
     temperature: float | None = None     # falls back to settings.llm.default_temperature
     history_token_budget: int | None = None
     image_detail: str | None = None      # "low" | "high" | "auto"; falls back to settings.llm.default_image_detail
-    # "tool" → eager OCR shim flattens images to text before the agent sees them
-    # (default; cheaper, better compactor accuracy). "direct" → pass image
-    # blocks straight to the provider (high-fidelity multi-turn visual chat).
+    # "tool" → inbound images become placeholder text blocks (no pre-OCR).
+    # "direct" → pass image blocks straight to the provider (high-fidelity
+    # multi-turn visual chat).
     # None → fall back to settings.llm.default_vision_strategy.
     vision_strategy: str | None = None
 

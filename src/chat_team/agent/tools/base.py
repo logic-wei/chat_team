@@ -47,7 +47,7 @@ class ToolContext:
     # all production tool invocations carry the agent's provider so tools that
     # need vision/text completion (e.g. describe_image) can run.
     llm: "LLMProvider | None" = None
-    # Optional separate provider for vision/OCR calls (eager shim + describe_image).
+    # Optional separate provider for vision/OCR calls (describe_image).
     # When set, vision-aware tools (describe_image) use this instead of ``llm``.
     # None means "fall back to llm".
     vision_llm: "LLMProvider | None" = None

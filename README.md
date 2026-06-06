@@ -19,6 +19,8 @@
 - **持久化**:`session.json` debounce 10s 原子刷盘,重启后会话历史和当前在岗员工照旧。
 - **媒体落地**:image / file / video 通过每条消息独立的 AES-256-CBC `aeskey` 解密后
   自动入 `<cwd>/inbox/`,Agent 收到一条文本指针。
+- **图像默认占位符直通**:默认 `vision_strategy=tool` 下,入站图片不会前置 OCR,只注入
+  `[图:相对路径]` 占位符;需要识别时由 `describe_image` 按需批量并发处理。
 
 ## 安装
 

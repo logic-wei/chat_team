@@ -67,20 +67,12 @@ class LLMConfig:
     default_temperature: float = 0.3
     default_history_token_budget: int = 12000
     default_image_detail: str = "high"   # "low" | "high" | "auto"; consulted when role doesn't set image_detail
-    # Vision handling strategy: "tool" runs an eager OCR/describe shim on
-    # inbound images and feeds the agent text only; "direct" hands the raw
-    # image blocks to the provider every turn (legacy behaviour).
+    # Vision handling strategy: "tool" turns inbound images into placeholders
+    # (no pre-OCR); "direct" hands raw image blocks to the provider.
     default_vision_strategy: str = "tool"
-    # Optional override for the model used by the eager shim and the
-    # describe_image tool. Empty → reuse default_model.
+    # Optional override for the model used by the describe_image tool.
+    # Empty → reuse default_model.
     default_vision_model: str = ""
-    # Detail level used by the eager shim. OCR needs "high" to read small
-    # printed text reliably; agents can still call describe_image with a
-    # different detail to opt in to a cheaper or finer pass.
-    default_eager_detail: str = "high"
-    # Prompt used by the eager shim. Empty → fall back to the OCR-with-
-    # fallback prompt defined in runtime.vision_shim.DEFAULT_OCR_PROMPT.
-    default_eager_prompt: str = ""
     # When true, every OpenAI provider call writes a JSON file to
     # <workspace>/.chat_team/llm/ recording the request payload (with
     # base64 image data URIs redacted), the response, token usage, and
