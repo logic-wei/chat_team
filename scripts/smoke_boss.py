@@ -288,6 +288,7 @@ def test_boss_tool_registry_complete() -> None:
         "list_roles", "read_role", "write_role", "delete_role",
         "read_team_profile", "write_team_profile",
         "list_available_tools", "list_skills",
+        "read_deploy_config",
     }
     got = set(reg._tools.keys())  # noqa: SLF001
     assert got == expected, f"tool mismatch: missing={expected - got}, extra={got - expected}"

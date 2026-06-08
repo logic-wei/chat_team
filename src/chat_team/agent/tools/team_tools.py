@@ -318,3 +318,36 @@ class ListSkillsTool(Tool):
             first_line = entry["description"].split("\n", 1)[0].strip()
             lines.append(f"- {entry['name']} [{entry['source']}]: {first_line}")
         return "\n".join(lines)
+
+
+class ReadDeployConfigTool(Tool):
+    name = "read_deploy_config"
+    description = (
+        "读取 config.yaml 中的部署拓扑(mode / default_role / bots 角色绑定)。"
+        "不返回任何凭证(bot_id / secret 不可见)。"
+    )
+    parameters = {"type": "object", "properties": {}}
+
+    async def run(self, ctx: ToolContext, **kwargs: Any) -> str:
+        path = ctx.settings.paths.config_yaml
+        raw: dict[str, Any] = {}
+        if path.exists():
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded, dict):
+                raw = loaded
+
+        mode = raw.get("mode", "team")
+        default_role = raw.get("default_role", "team_admin")
+        bots_raw = raw.get("bots") if isinstance(raw.get("bots"), list) else []
+
+        lines = [f"mode: {mode}", f"default_role: {default_role}"]
+        if not bots_raw:
+            lines.append("bots: (未配置)")
+        elif mode == "solo":
+            lines.append(f"bots ({len(bots_raw)}个):")
+            for i, b in enumerate(bots_raw):
+                name = b.get("name", "") if isinstance(b, dict) else ""
+                lines.append(f"  {i + 1}. name: {name or '(未指定)'}")
+        else:
+            lines.append(f"bots: {len(bots_raw)}个(team 模式无需 name)")
+        return "\n".join(lines)

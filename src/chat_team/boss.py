@@ -22,6 +22,7 @@ from .agent.tools.team_tools import (
     ListAvailableToolsTool,
     ListRolesTool,
     ListSkillsTool,
+    ReadDeployConfigTool,
     ReadRoleTool,
     ReadTeamProfileTool,
     WriteRoleTool,
@@ -88,6 +89,18 @@ BOSS_ROLE = Role(
         "- 自由 markdown,内容会被原样注入,建议 ≤ 300 字。\n"
         "- 写空字符串 = 清空 = 关闭注入(向后兼容)。\n"
         "\n"
+        "[部署模式]\n"
+        "config.yaml 中的 mode 决定运行方式,由用户手动配置,boss 不修改:\n"
+        "- team(默认):一个 bot,多角色,通过 transfer_to_employee 转接。\n"
+        "- solo:每个 bot 绑一个角色(bots[].name = 角色名),无 transfer_to_employee,"
+        "各 bot 独立对话,同群聊共享 notebook。\n"
+        "\n"
+        "用 read_deploy_config 查看当前模式。根据模式给出对口建议:\n"
+        "- solo 模式:角色不要配 transfer_to_employee;提醒用户在 config.yaml 的 bots 里"
+        "添加对应条目(name 必须匹配角色名)。\n"
+        "- team 模式:前台角色需要 transfer_to_employee;注意 default_role 是新会话入口。\n"
+        "模式切换和 bot 凭证配置请引导用户手动编辑 config.yaml。\n"
+        "\n"
         "[语气]\n"
         "全程使用中文。简洁、直接、给推荐。能少让用户打字就少让用户打字 —— 你应该主动给出"
         "默认值并请用户确认或修改,而不是反复发问。"
@@ -101,6 +114,7 @@ BOSS_ROLE = Role(
         "write_team_profile",
         "list_available_tools",
         "list_skills",
+        "read_deploy_config",
     ],
     llm=RoleLLMConfig(temperature=0.4, history_token_budget=12000),
     welcome_message=None,
@@ -140,6 +154,7 @@ def build_boss_tool_registry() -> ToolRegistry:
     reg.register(WriteTeamProfileTool())
     reg.register(ListAvailableToolsTool())
     reg.register(ListSkillsTool())
+    reg.register(ReadDeployConfigTool())
     return reg
 
 
@@ -171,6 +186,8 @@ def _print_intro(settings: Settings) -> None:
     user_dir = settings.paths.user_roles_dir
     user_roles = sorted(p.stem for p in user_dir.glob("*.yaml")) if user_dir.exists() else []
     print(f"用户自定义角色: {', '.join(user_roles) if user_roles else '(无)'}")
+    mode_label = "solo（一 bot 一角色）" if settings.mode == "solo" else "team（多角色转接）"
+    print(f"部署模式: {mode_label}")
     print()
     print("直接说想做什么 —— 比如:'加一个数据分析师'、'我们公司是 X,改一下 team.md'。")
     print("回车空输入 = 跳过;输入 /quit 或 Ctrl-D 退出。")
