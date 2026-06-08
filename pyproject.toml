@@ -16,6 +16,7 @@ dependencies = [
     "aiohttp>=3.9",         # for media download in stage 7
     "cryptography>=42",     # for AES decrypt of media URLs
     "mcp>=1.0",             # MCP client for external tool servers
+    "textual>=1.0",         # TUI for boss CLI
 ]
 
 [project.scripts]

@@ -236,7 +236,21 @@ async def _async_main() -> None:
 
 
 def run() -> None:
-    asyncio.run(_async_main())
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="chat-team-boss")
+    parser.add_argument(
+        "--no-tui", action="store_true",
+        help="Use plain stdin/stdout instead of the TUI",
+    )
+    args = parser.parse_args()
+
+    if args.no_tui or not sys.stdin.isatty():
+        asyncio.run(_async_main())
+    else:
+        from .boss_tui import run_tui
+
+        run_tui()
 
 
 if __name__ == "__main__":

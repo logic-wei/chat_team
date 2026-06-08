@@ -174,7 +174,7 @@ def build_dispatcher(
     )
 
 
-def configure_logging(settings: Settings) -> None:
+def configure_logging(settings: Settings, *, file_only: bool = False) -> None:
     settings.paths.logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = settings.paths.logs_dir / "chat_team.log"
     level = getattr(logging, settings.log_level.upper(), logging.INFO)
@@ -184,10 +184,13 @@ def configure_logging(settings: Settings) -> None:
         backupCount=settings.logging.backup_count,
         encoding="utf-8",
     )
+    handlers: list[logging.Handler] = [rotating]
+    if not file_only:
+        handlers.append(logging.StreamHandler())
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
-        handlers=[rotating, logging.StreamHandler()],
+        handlers=handlers,
     )
 
 
