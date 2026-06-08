@@ -83,6 +83,9 @@ class ToolRegistry:
     def has(self, name: str) -> bool:
         return name in self._tools
 
+    def names(self) -> list[str]:
+        return list(self._tools.keys())
+
     def specs_for(self, names: list[str]) -> list[ToolSpec]:
         return [self._tools[n].spec() for n in names if n in self._tools]
 

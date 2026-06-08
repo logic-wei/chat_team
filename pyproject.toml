@@ -15,6 +15,7 @@ dependencies = [
     "websockets>=12",
     "aiohttp>=3.9",         # for media download in stage 7
     "cryptography>=42",     # for AES decrypt of media URLs
+    "mcp>=1.0",             # MCP client for external tool servers
 ]
 
 [project.scripts]

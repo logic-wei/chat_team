@@ -30,6 +30,7 @@ python scripts/smoke_critical_fixes.py            # persistence-race snapshot + 
 python scripts/smoke_p0_fixes.py                  # reconnect + env scrub + LRU + janitor + LLM retry
 python scripts/smoke_split_llm.py                 # vision_llm vs chat_llm split: build_vision_llm_provider + DescribeImageTool routing
 python scripts/smoke_p0_round2.py                 # _bg_tasks strong-ref + concurrent get_or_create + eviction off event loop + finish-before-post_turn
+python scripts/smoke_mcp.py                       # MCP proxy tool + config parsing + agent integration
 
 # Conversational team-setup CLI (not the WeCom bot — see "Boss agent" below).
 chat-team-boss
@@ -140,13 +141,54 @@ Key isolation points:
 
 ## Adding a role / tool
 
-**Role** — drop a YAML in `src/chat_team/roles/builtin/` (committed) or `~/.chat_team/roles/` (user override, takes precedence). Required fields: `name`, `system_prompt`, `tools` (a subset of registered tool names). Optional: `display_name`, `welcome_message` (used for `enter_chat`), `llm.{model,temperature,history_token_budget,image_detail,vision_strategy}`. `vision_strategy: tool|direct` overrides the global default — set `direct` on a role that needs raw images in context (e.g. art critique). No code changes needed — `RoleRegistry.load` picks it up and `transfer_to_employee`'s enum is rebuilt from `roles.names()`.
+**Role** — drop a YAML in `src/chat_team/roles/builtin/` (committed) or `~/.chat_team/roles/` (user override, takes precedence). Required fields: `name`, `system_prompt`, `tools` (a subset of registered tool names). Optional: `display_name`, `welcome_message` (used for `enter_chat`), `llm.{model,temperature,history_token_budget,image_detail,vision_strategy}`, `mcp_servers` (list of MCP server names from `config.yaml`). `vision_strategy: tool|direct` overrides the global default — set `direct` on a role that needs raw images in context (e.g. art critique). No code changes needed — `RoleRegistry.load` picks it up and `transfer_to_employee`'s enum is rebuilt from `roles.names()`.
 
 **Tool** — subclass `Tool` (`src/chat_team/agent/tools/base.py`), set `name`/`description`/`parameters` (JSON schema), implement `async run(ctx, **kwargs)`. Register in `app.build_tool_registry`. Reference it in role YAMLs that should expose it. Raise `ToolError` for recoverable failures (returned to the LLM as a tool message); raise `TransferRequested` only if you're implementing role-switch semantics. If your tool needs to call the LLM (e.g. vision/embedding), read `ctx.llm` — `ToolContext.llm` is wired to `agent.llm` so the tool reuses the same provider configuration.
 
 **Skill** — a no-code capability pack: drop a directory at `~/.chat_team/skills/<name>/` containing `SKILL.md` (YAML frontmatter + markdown body) plus optional auxiliary files. Frontmatter must have `name` (must equal the directory name) and `description` (single line preferred — multi-line works but only the first line lands in the system-prompt TOC). Body is whatever instructions you want the agent to follow when invoked. To expose a skill to a role, list it under `skills:` in the role YAML AND include `skill` (and optionally `skill_read_file`) in `tools:`. The agent sees a `[可用 skills] - name: description` block in its system prompt, fetches the body via `skill(name=...)`, and reads aux files via `skill_read_file(skill=..., path=...)`. `SkillRegistry.load` mirrors `RoleRegistry.load`: builtin (`src/chat_team/skills/builtin/`) first, user dir overrides by name. Malformed skills (missing/invalid frontmatter, name/dir mismatch, missing SKILL.md) are logged at WARNING and skipped — one bad dir won't break the rest. Per-role gating happens twice: once when rendering the TOC (filtered to `role.skills ∩ registry.names()`) and again at tool invocation in `SkillTool.run`. The `enum` on the JSON-schema parameters is the full registry (one tool instance for all roles), so the runtime check is the real gate. No hot reload — restart `chat-team` after adding/editing skills.
 
 **Python deps for skills (uv + PEP 723).** SKILL.md format is deliberately kept 100% compatible with community skills (frontmatter only carries `name` + `description`), so per-skill dependency declarations are out of scope. Instead: when a role's `tools` contains **both** `skill` and `run_command`, `Agent._build_system_messages` splices in the `PYTHON_UV_CONVENTION` block (`agent/agent.py`) — it tells the agent to write Python scripts with PEP 723 inline metadata (`# /// script\n# dependencies = [...]\n# ///`) and run them via `uv run script.py`. `uv` resolves deps into its global content-addressed env cache (`~/.cache/uv/environments-v2/<hash>/`), shared across sessions/roles/workspaces with zero per-workspace state. `app.warn_if_uv_missing` logs a WARNING on startup if any loaded role would need `uv` but it isn't on PATH; the bot still runs (non-Python skills unaffected). Why not per-workspace venv: 100 sessions × 100MB site-packages is wasteful in a multi-tenant bot. Why not `pip_install` tool: reactive install-on-import-fail costs a full LLM turn per missed dep.
+
+## MCP (Model Context Protocol)
+
+MCP 让角色无需写 Python 即可使用外部工具服务器。用户在 `config.yaml` 声明 MCP 服务器，在角色 YAML 的 `mcp_servers` 字段引用，启动时自动发现并注册工具。
+
+**配置。** `config.yaml` 新增 `mcp:` 节，字典风格（与 Claude Desktop 等 MCP 客户端一致）：
+
+```yaml
+mcp:
+  servers:
+    filesystem:                          # 服务器名 — 角色 YAML 中引用
+      command: npx                       # stdio transport: 启动子进程
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+    github:
+      command: npx
+      args: ["-y", "@modelcontextprotocol/server-github"]
+      env:                               # 传给子进程的额外环境变量
+        GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_..."
+    remote_api:
+      url: http://localhost:8080/sse     # SSE transport: 连接远程服务
+```
+
+Transport 自动推断：有 `command` → stdio，有 `url` → SSE，二选一。服务器名须匹配 `[a-zA-Z0-9_-]+` 且不含 `__`（双下划线用于注册名分隔）。
+
+**角色引用。** 在角色 YAML 中添加 `mcp_servers` 字段，列出要使用的服务器名：
+
+```yaml
+name: developer
+tools: [read_file, write_file, run_command, transfer_to_employee]
+mcp_servers: [filesystem, github]        # 该角色可使用这两个 MCP 服务器的所有工具
+```
+
+**注册名。** MCP 工具注册为 `mcp__<server>__<tool>`（如 `mcp__filesystem__read_file`），符合 OpenAI function name regex。`Agent._effective_tool_names()` 在每轮调用 LLM 时自动展开 `role.mcp_servers` 为具体工具名，与内置工具合并后传给 `ToolRegistry.specs_for()`。
+
+**生命周期。** `app._async_main` 在 `build_dispatcher` 之前调用 `McpClientManager.connect_all()` 连接所有配置的服务器、发现工具、创建 `McpProxyTool` 实例，然后通过 `build_tool_registry(extra_tools=...)` 注入 `ToolRegistry`。`finally` 块调用 `close_all()` 关闭连接。单个服务器连接失败记 WARNING 并跳过，不阻塞启动。
+
+**工具调用。** `McpProxyTool.run()` 调用 MCP SDK 的 `session.call_tool()`，结果中的 `TextContent` 直接取 `.text`，`ImageContent` 降级为 `[image: mime]` 占位符。MCP 返回 `isError=True` 或底层异常均包装为 `ToolError`，走已有的 agent 错误处理流程。
+
+**关键文件：** `src/chat_team/mcp/config.py`（配置 dataclass）、`src/chat_team/mcp/client.py`（`McpClientManager` 生命周期）、`src/chat_team/mcp/proxy_tool.py`（`McpProxyTool(Tool)` 桥接）。
+
+**限制。** 当前只支持 MCP Tools，不支持 Resources / Prompts。不支持热加载——修改 MCP 配置需重启 bot。`chat-team-tools` CLI 不列出 MCP 工具（它们是运行时动态发现的）。
 
 ## Things to not break
 

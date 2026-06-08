@@ -8,7 +8,7 @@ import os
 import shutil
 
 from .adapters.base import BotAdapter
-from .agent.tools.base import ToolRegistry
+from .agent.tools.base import Tool, ToolRegistry
 from .agent.tools.describe_image import DescribeImageTool
 from .agent.tools.file_tools import (
     EditFileTool,
@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 def build_tool_registry(
     roles: RoleRegistry,
     skills: SkillRegistry | None = None,
+    extra_tools: list[Tool] | None = None,
 ) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(ReadFileTool())
@@ -61,6 +62,8 @@ def build_tool_registry(
     if skills is not None and skills.names():
         reg.register(SkillTool(skills=skills, roles=roles))
         reg.register(SkillReadFileTool(skills=skills, roles=roles))
+    for tool in extra_tools or []:
+        reg.register(tool)
     return reg
 
 
@@ -138,11 +141,14 @@ def warn_if_uv_missing(roles: RoleRegistry) -> None:
     )
 
 
-def build_dispatcher(settings: Settings) -> Dispatcher:
+def build_dispatcher(
+    settings: Settings,
+    extra_tools: list[Tool] | None = None,
+) -> Dispatcher:
     roles = RoleRegistry.load(settings.paths.user_roles_dir)
     skills = SkillRegistry.load(settings.paths.user_skills_dir)
     warn_if_uv_missing(roles)
-    tools = build_tool_registry(roles, skills)
+    tools = build_tool_registry(roles, skills, extra_tools=extra_tools)
     persistence = PersistenceManager(settings)
     sessions = SessionManager(settings, persistence=persistence)
     llm = build_llm_provider(settings)
@@ -172,10 +178,23 @@ def configure_logging(settings: Settings) -> None:
 
 
 async def _async_main(adapter_factory) -> None:
+    from .mcp.client import McpClientManager
+
     settings = load_settings()
     configure_logging(settings)
     log.info("chat_team starting; home=%s", settings.paths.home)
-    dispatcher = build_dispatcher(settings)
+
+    mcp_manager = McpClientManager()
+    mcp_tools: list[Tool] = []
+    if settings.mcp.servers:
+        mcp_tools = await mcp_manager.connect_all(settings.mcp.servers)
+        log.info(
+            "MCP: %d tool(s) from %d server(s)",
+            len(mcp_tools),
+            len(settings.mcp.servers),
+        )
+
+    dispatcher = build_dispatcher(settings, extra_tools=mcp_tools)
     adapter: BotAdapter = adapter_factory(settings, dispatcher.sessions.workspace_for)
     adapter.set_handler(dispatcher.handle)
     try:
@@ -191,6 +210,7 @@ async def _async_main(adapter_factory) -> None:
         await adapter.close()
         if dispatcher.persistence is not None:
             await dispatcher.persistence.flush_all(dispatcher.sessions.all_sessions())
+        await mcp_manager.close_all()
 
 
 def run() -> None:

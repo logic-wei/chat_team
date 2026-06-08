@@ -24,6 +24,12 @@ tools:
   - describe_image
   - transfer_to_employee
 
+# MCP 外部工具服务器 — 引用 config.yaml 中 mcp.servers 下定义的服务器名。
+# 取消注释并确保 config.yaml 中已配置对应服务器即可使用。
+# mcp_servers:
+#   - filesystem
+#   - github
+
 llm:
   model: ""
   temperature: 0.2

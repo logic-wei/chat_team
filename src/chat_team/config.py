@@ -1,14 +1,18 @@
 """Load configuration from ``~/.chat_team/config.yaml`` and ``~/.chat_team/.env``."""
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+_log = logging.getLogger(__name__)
+
 import yaml
 from dotenv import load_dotenv
 
+from .mcp.config import McpServerConfig
 from .paths import Paths, init_home
 
 
@@ -155,6 +159,11 @@ class LoggingConfig:
 
 
 @dataclass
+class McpConfig:
+    servers: list[McpServerConfig] = field(default_factory=list)
+
+
+@dataclass
 class Settings:
     paths: Paths
     workspace_root: Path
@@ -166,6 +175,7 @@ class Settings:
     llm: LLMConfig = field(default_factory=LLMConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
     team_profile: str = ""
     env: dict[str, str] = field(default_factory=dict)
 
@@ -247,6 +257,27 @@ def load_settings(paths: Paths | None = None) -> Settings:
         _coerce(settings.logging, raw["logging"])
     if isinstance(raw.get("cleanup"), dict):
         _coerce(settings.cleanup, raw["cleanup"])
+
+    if isinstance(raw.get("mcp"), dict):
+        servers_raw = raw["mcp"].get("servers")
+        if isinstance(servers_raw, dict):
+            mcp_servers: list[McpServerConfig] = []
+            for srv_name, srv_cfg in servers_raw.items():
+                if not isinstance(srv_cfg, dict):
+                    continue
+                cfg = McpServerConfig(
+                    name=str(srv_name),
+                    command=srv_cfg.get("command", ""),
+                    args=list(srv_cfg.get("args") or []),
+                    env=dict(srv_cfg.get("env") or {}),
+                    url=srv_cfg.get("url", ""),
+                )
+                try:
+                    cfg.validate()
+                    mcp_servers.append(cfg)
+                except ValueError:
+                    _log.warning("skipping invalid mcp server %r", srv_name, exc_info=True)
+            settings.mcp = McpConfig(servers=mcp_servers)
 
     settings.env = {
         k: v for k, v in os.environ.items()

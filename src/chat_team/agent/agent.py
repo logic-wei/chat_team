@@ -128,6 +128,15 @@ class Agent:
             + toc
         )
 
+    def _effective_tool_names(self) -> list[str]:
+        names = list(self.role.tools)
+        if self.role.mcp_servers:
+            all_names = self.tools.names()
+            for s in self.role.mcp_servers:
+                prefix = f"mcp__{s}__"
+                names.extend(n for n in all_names if n.startswith(prefix))
+        return names
+
     # ---- main loop ---------------------------------------------------------
 
     async def handle(
@@ -151,7 +160,7 @@ class Agent:
                 sys_msgs = self._build_system_messages()
                 request = CompletionRequest(
                     messages=sys_msgs + self.history,
-                    tools=self.tools.specs_for(self.role.tools),
+                    tools=self.tools.specs_for(self._effective_tool_names()),
                     model=self._model(),
                     temperature=self._temperature(),
                     reasoning_effort=self._reasoning_effort(),

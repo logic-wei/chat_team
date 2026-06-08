@@ -48,3 +48,31 @@ llm:
 logging:
   max_bytes: 10485760                # 10 MB per log file
   backup_count: 5                    # keep 5 rotated files
+
+# MCP (Model Context Protocol) — 连接外部工具服务器,无需写 Python 即可扩展角色能力。
+#
+# 使用步骤:
+#   1. 取消下方注释,配置 MCP 服务器
+#   2. 在角色 YAML 中添加 mcp_servers: [服务器名] 授权角色使用
+#   3. 重启 bot — 启动日志会显示发现了多少工具
+#
+# Transport 自动推断: command → stdio (启动子进程), url → SSE (连接远程服务)
+# 服务器名须匹配 [a-zA-Z0-9_-]+,不含双下划线 __
+#
+# mcp:
+#   servers:
+#     filesystem:                         # 服务器名 — 角色 YAML 的 mcp_servers 引用此名
+#       command: npx                      # stdio: 启动子进程
+#       args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+#     github:
+#       command: npx
+#       args: ["-y", "@modelcontextprotocol/server-github"]
+#       env:                              # 传给子进程的额外环境变量
+#         GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_..."
+#     remote_api:
+#       url: http://localhost:8080/sse    # SSE: 连接远程 MCP 服务
+#
+# 角色 YAML 示例:
+#   mcp_servers:
+#     - filesystem
+#     - github

@@ -29,6 +29,7 @@ class Role:
     system_prompt: str
     tools: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
+    mcp_servers: list[str] = field(default_factory=list)
     llm: RoleLLMConfig = field(default_factory=RoleLLMConfig)
     welcome_message: str | None = None   # used for enter_chat events
 
@@ -55,6 +56,11 @@ class Role:
         skills_raw = raw.get("skills") or []
         if not isinstance(skills_raw, list) or not all(isinstance(s, str) for s in skills_raw):
             raise ValueError("role yaml 'skills' must be a list of strings")
+        mcp_servers_raw = raw.get("mcp_servers") or []
+        if not isinstance(mcp_servers_raw, list) or not all(
+            isinstance(s, str) for s in mcp_servers_raw
+        ):
+            raise ValueError("role yaml 'mcp_servers' must be a list of strings")
         return cls(
             name=name,
             display_name=raw.get("display_name", name),
@@ -62,6 +68,7 @@ class Role:
             system_prompt=raw.get("system_prompt", "").strip(),
             tools=list(raw.get("tools") or []),
             skills=list(skills_raw),
+            mcp_servers=list(mcp_servers_raw),
             llm=llm,
             welcome_message=raw.get("welcome_message"),
         )
