@@ -10,7 +10,7 @@ A WeCom (企业微信) AI Bot that fronts a team of role-differentiated "virtual
 
 ```bash
 # Run the bot (long-connection WeCom WebSocket).
-# First run seeds ~/.chat_team/{config.yaml,.env,roles,workspaces,logs,state}.
+# First run seeds ~/.chat_team/{config.yaml,roles,workspaces,logs,state}.
 python main.py
 
 # Smoke tests — all are pure Python, no LLM/network. Run individually.
@@ -48,8 +48,8 @@ All persistent state lives under `~/.chat_team/` (override with `CHAT_TEAM_HOME`
 
 ```
 ~/.chat_team/
-  config.yaml              # global knobs; defaults written on first run
-  .env                     # WECOM_BOT_ID, WECOM_SECRET, OPENAI_API_KEY, OPENAI_BASE_URL
+  config.yaml              # all configuration + credentials (chmod 0600); defaults written on first run
+  .env                     # (legacy fallback) env vars still loaded if present; new installs don't create this
   team.md                  # global team profile; injected into every agent's system prompt
   roles/                   # user-defined role YAMLs override builtins by name
   skills/                  # user-defined skill dirs (<name>/SKILL.md + aux files) override builtins by name
@@ -122,7 +122,7 @@ Key isolation points:
 
 **Vision strategy (eager OCR shim).** Default `settings.llm.vision.strategy = "tool"` runs every inbound image through `describe_images()` *before* `agent.handle` — pre-OCR'd descriptions land in the user message text, so `agent.history` is text-only and the compactor counts real token weight. The agent never sees raw images in tool mode (except via the `describe_image` tool when it wants a different prompt). Why eager-not-lazy: agent reliability ("forgot to call the tool") is eliminated, OCR-heavy multi-turn workloads see ~6× token savings, and the per-turn LLM call upcharge is repaid by cross-turn caching. **`direct` strategy** keeps the original list content and falls back to in-context vision (the pre-shim behaviour) — set `llm.vision_strategy: direct` on a role YAML for high-fidelity visual chat (e.g. art/diagram analysis). Invalid `vision_strategy` values silently fall back to the settings default with a warning. `default_eager_prompt` (in `settings.llm`) is the prompt fed to OCR — defaults to OCR-priority with a fallback short caption; users can override per-deployment in `~/.chat_team/config.yaml`. `default_eager_detail` defaults to `"high"` because `low` can't read small text.
 
-**Split vision / chat providers.** 视觉/OCR 调用可以走独立的 API 端点。凭证统一通过 `.env` 环境变量配置（与主模型一致）：`OPENAI_VISION_API_KEY` 和 `OPENAI_VISION_BASE_URL`，不设则回落至主 `OPENAI_API_KEY` / `OPENAI_BASE_URL`。`config.yaml` 的 `llm` 节点中用 `llm.vision.model` 指定视觉模型名称（留空则复用 `llm.chat.model`）。当凭证与主模型相同时复用同一 `LLMProvider` 实例（不多开连接）。`app.build_vision_llm_provider` 处理此逻辑；`Dispatcher` 持有 `self._vision_llm` 并传给急切 OCR shim（`apply_vision_strategy`）和 `Agent` 构造（`describe_image` 工具经 `ToolContext.vision_llm` 使用）。Compactor 始终用聊天模型。
+**Split vision / chat providers.** 视觉/OCR 调用可以走独立的 API 端点。凭证在 `config.yaml` 的 `llm.vision.api_key` / `llm.vision.base_url` 配置，留空则回落至 `llm.api_key` / `llm.base_url`；也可通过 `OPENAI_VISION_API_KEY` / `OPENAI_VISION_BASE_URL` 环境变量设置（config.yaml 优先）。`llm.vision.model` 指定视觉模型名称（留空则复用 `llm.chat.model`）。当凭证与主模型相同时复用同一 `LLMProvider` 实例（不多开连接）。`app.build_vision_llm_provider` 处理此逻辑；`Dispatcher` 持有 `self._vision_llm` 并传给急切 OCR shim（`apply_vision_strategy`）和 `Agent` 构造（`describe_image` 工具经 `ToolContext.vision_llm` 使用）。Compactor 始终用聊天模型。
 
 **Image description cache.** `chat_team.llm.image_description_cache.ImageDescriptionCache` is a process-level LRU keyed by `(abs_path, mtime_ns, size, detail, model, prompt)` → description text. Caps: `MAX_ENTRIES=128`, `MAX_TOTAL_BYTES≈1MB`. Module-level singleton via `default_cache()`; same image with same prompt+detail+model is OCR'd exactly once across roles, sessions, and turns within a process. Different prompt or different file mtime/size invalidates. The cache is shared by both the eager shim AND the `describe_image` tool, so an agent re-querying with a custom prompt only pays for prompts not already cached.
 

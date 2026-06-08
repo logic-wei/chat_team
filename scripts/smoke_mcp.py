@@ -151,7 +151,7 @@ def test_config_parsing():
     home = Path("/tmp/chat_team_mcp_smoke")
     shutil.rmtree(home, ignore_errors=True)
     home.mkdir(parents=True)
-    (home / ".env").write_text("OPENAI_API_KEY=test\n")
+    os.environ.setdefault("OPENAI_API_KEY", "test")
 
     cfg_yaml = home / "config.yaml"
     cfg_yaml.write_text("""\
@@ -194,7 +194,7 @@ def test_config_invalid_server_skipped():
     home = Path("/tmp/chat_team_mcp_smoke")
     shutil.rmtree(home, ignore_errors=True)
     home.mkdir(parents=True)
-    (home / ".env").write_text("OPENAI_API_KEY=test\n")
+    os.environ.setdefault("OPENAI_API_KEY", "test")
 
     cfg_yaml = home / "config.yaml"
     cfg_yaml.write_text("""\
@@ -219,7 +219,7 @@ def test_config_no_mcp_section():
     home = Path("/tmp/chat_team_mcp_smoke")
     shutil.rmtree(home, ignore_errors=True)
     home.mkdir(parents=True)
-    (home / ".env").write_text("OPENAI_API_KEY=test\n")
+    os.environ.setdefault("OPENAI_API_KEY", "test")
     (home / "config.yaml").write_text("default_role: team_admin\n")
     settings = load_settings()
     assert settings.mcp.servers == []
@@ -317,7 +317,7 @@ def test_effective_tool_names():
     home = Path("/tmp/chat_team_mcp_smoke")
     shutil.rmtree(home, ignore_errors=True)
     home.mkdir(parents=True)
-    (home / ".env").write_text("OPENAI_API_KEY=test\n")
+    os.environ.setdefault("OPENAI_API_KEY", "test")
     (home / "config.yaml").write_text("")
     settings = load_settings()
 
@@ -355,7 +355,7 @@ def test_effective_tool_names_no_mcp():
     home = Path("/tmp/chat_team_mcp_smoke")
     shutil.rmtree(home, ignore_errors=True)
     home.mkdir(parents=True)
-    (home / ".env").write_text("OPENAI_API_KEY=test\n")
+    os.environ.setdefault("OPENAI_API_KEY", "test")
     (home / "config.yaml").write_text("")
     settings = load_settings()
 
@@ -398,7 +398,7 @@ async def test_agent_invokes_mcp_tool():
     home = Path("/tmp/chat_team_mcp_smoke")
     shutil.rmtree(home, ignore_errors=True)
     home.mkdir(parents=True)
-    (home / ".env").write_text("OPENAI_API_KEY=test\n")
+    os.environ.setdefault("OPENAI_API_KEY", "test")
     (home / "config.yaml").write_text("")
     settings = load_settings()
 

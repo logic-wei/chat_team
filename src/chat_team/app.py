@@ -73,10 +73,13 @@ def build_tool_registry(
 def build_llm_provider(settings: Settings) -> LLMProvider:
     if settings.llm.provider != "openai":
         raise NotImplementedError(f"llm provider not supported yet: {settings.llm.provider}")
-    api_key = os.environ.get("OPENAI_API_KEY", "")
+    api_key = settings.llm.api_key or os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY missing — set it in ~/.chat_team/.env")
-    base_url = os.environ.get("OPENAI_BASE_URL") or None
+        raise RuntimeError(
+            "LLM API key missing — set llm.api_key in ~/.chat_team/config.yaml "
+            "or the OPENAI_API_KEY environment variable"
+        )
+    base_url = settings.llm.base_url or os.environ.get("OPENAI_BASE_URL") or None
     return OpenAIChatCompletionProvider(
         api_key=api_key,
         base_url=base_url,
@@ -101,11 +104,19 @@ def build_vision_llm_provider(settings: Settings, main_llm: LLMProvider) -> LLMP
     When the resolved vision credentials are identical to the main provider's,
     ``main_llm`` is returned as-is to avoid duplicate connections.
     """
-    main_api_key = os.environ.get("OPENAI_API_KEY", "")
-    main_base_url = os.environ.get("OPENAI_BASE_URL") or None
+    main_api_key = settings.llm.api_key or os.environ.get("OPENAI_API_KEY", "")
+    main_base_url = settings.llm.base_url or os.environ.get("OPENAI_BASE_URL") or None
 
-    vision_api_key = os.environ.get("OPENAI_VISION_API_KEY", "") or main_api_key
-    vision_base_url = (os.environ.get("OPENAI_VISION_BASE_URL", "") or main_base_url) or None
+    vision_api_key = (
+        settings.llm.vision.api_key
+        or os.environ.get("OPENAI_VISION_API_KEY", "")
+        or main_api_key
+    )
+    vision_base_url = (
+        settings.llm.vision.base_url
+        or os.environ.get("OPENAI_VISION_BASE_URL", "")
+        or main_base_url
+    ) or None
 
     # Reuse the main provider when credentials are identical — no extra connections.
     if vision_api_key == main_api_key and vision_base_url == main_base_url:
@@ -258,7 +269,12 @@ async def _async_main(adapter_factory) -> None:
         return
 
     dispatcher = build_dispatcher(settings, extra_tools=mcp_tools)
-    adapter: BotAdapter = adapter_factory(settings, dispatcher.sessions.workspace_for)
+    bot = settings.bots[0] if settings.bots else None
+    adapter: BotAdapter = adapter_factory(
+        settings, dispatcher.sessions.workspace_for,
+        bot_id=bot.bot_id if bot else None,
+        secret=bot.secret if bot else None,
+    )
     adapter.set_handler(dispatcher.handle)
     try:
         # Prefer run_forever (handles transient WS loss); fall back to the

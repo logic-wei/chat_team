@@ -186,8 +186,8 @@ class WeComBotAdapter(BotAdapter):
         role_name: str | None = None,
     ):
         self.settings = settings
-        self.bot_id = bot_id or settings.get_env("WECOM_BOT_ID") or ""
-        self.secret = secret or settings.get_env("WECOM_SECRET") or ""
+        self.bot_id = bot_id or ""
+        self.secret = secret or ""
         self.role_name = role_name
         self._handler: MessageHandler | None = None
         # Per-adapter (lifetime) state ----------------------------------
@@ -227,7 +227,7 @@ class WeComBotAdapter(BotAdapter):
         which handles transient connection loss with exponential backoff.
         """
         if not self.bot_id or not self.secret:
-            raise RuntimeError("WECOM_BOT_ID / WECOM_SECRET missing in ~/.chat_team/.env")
+            raise RuntimeError("WECOM_BOT_ID / WECOM_SECRET missing — set them under 'bots:' in ~/.chat_team/config.yaml")
         log.info("connecting to %s", WECOM_WS_URL)
         # WeCom uses application-level heartbeat ({"cmd":"ping"} every ~30s);
         # disable the websockets library's protocol-level auto-ping so it does
@@ -299,7 +299,7 @@ class WeComBotAdapter(BotAdapter):
     async def _open_connection(self) -> None:
         """Reset per-connection state, open socket, subscribe."""
         if not self.bot_id or not self.secret:
-            raise RuntimeError("WECOM_BOT_ID / WECOM_SECRET missing in ~/.chat_team/.env")
+            raise RuntimeError("WECOM_BOT_ID / WECOM_SECRET missing — set them under 'bots:' in ~/.chat_team/config.yaml")
         self._connection_dead = asyncio.Event()
         self._write_queue = asyncio.Queue(WRITE_QUEUE_MAXSIZE)
         self._pending_acks = {}

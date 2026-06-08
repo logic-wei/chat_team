@@ -62,10 +62,8 @@ async def _parse_full(adapter, frame):
 
 
 async def test_parse_inbound_single():
-    os.environ["WECOM_BOT_ID"] = "BOT123"
-    os.environ["WECOM_SECRET"] = "SEC"
-    settings = load_settings()                   # reload picks env
-    adapter = WeComBotAdapter(settings)
+    settings = load_settings()
+    adapter = WeComBotAdapter(settings, bot_id="BOT123", secret="SEC")
     frame = {
         "cmd": "aibot_msg_callback",
         "headers": {"req_id": "rq-1"},

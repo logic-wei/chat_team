@@ -96,8 +96,7 @@ def imsg(sid: str, text: str) -> IncomingMessage:
 async def test_spawn_bg_holds_strong_ref():
     print("== test 1: _spawn_bg keeps in-flight callbacks alive across GC ==")
     settings = load_settings()
-    settings.env.update({"WECOM_BOT_ID": "BOT", "WECOM_SECRET": "S"})
-    adapter = WeComBotAdapter(settings)
+    adapter = WeComBotAdapter(settings, bot_id="BOT", secret="S")
 
     completed = {"n": 0}
 

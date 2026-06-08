@@ -77,10 +77,8 @@ def init_home(home: Path | None = None) -> Paths:
 
     if not paths.config_yaml.exists():
         paths.config_yaml.write_text(_load_template("config.yaml"), encoding="utf-8")
-    if not paths.dotenv.exists():
-        paths.dotenv.write_text(_load_template("env.template"), encoding="utf-8")
         try:
-            os.chmod(paths.dotenv, 0o600)
+            os.chmod(paths.config_yaml, 0o600)
         except OSError:
             pass
     if not paths.team_md.exists():

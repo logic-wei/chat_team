@@ -45,8 +45,7 @@ from chat_team.session.persistence import PersistenceManager
 async def test_run_forever_reconnects_after_transient_failure():
     print("== test 1: run_forever reconnects after one failure ==")
     settings = load_settings()
-    settings.env.update({"WECOM_BOT_ID": "BOT", "WECOM_SECRET": "S"})
-    adapter = WeComBotAdapter(settings)
+    adapter = WeComBotAdapter(settings, bot_id="BOT", secret="S")
 
     calls = {"open": 0, "serve": 0, "shutdown_signaled": False}
 
@@ -94,8 +93,7 @@ async def test_run_forever_reconnects_after_transient_failure():
 async def test_close_stops_run_forever():
     print("== test 2: close() prevents further reconnect attempts ==")
     settings = load_settings()
-    settings.env.update({"WECOM_BOT_ID": "BOT", "WECOM_SECRET": "S"})
-    adapter = WeComBotAdapter(settings)
+    adapter = WeComBotAdapter(settings, bot_id="BOT", secret="S")
 
     open_calls = {"n": 0}
 

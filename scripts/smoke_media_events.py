@@ -109,13 +109,10 @@ async def test_adapter_image_flow():
     async def handler(inbound, stream):
         captured.append((inbound.session_id, inbound.content_blocks, inbound.text))
 
-    settings.env["WECOM_BOT_ID"] = "BOT"
-    settings.env["WECOM_SECRET"] = "S"
-
     def workspace_for(sid: str) -> Path:
         return workspace_root / sid
 
-    adapter = WeComBotAdapter(settings, workspace_resolver=workspace_for)
+    adapter = WeComBotAdapter(settings, workspace_resolver=workspace_for, bot_id="BOT", secret="S")
     adapter.set_handler(handler)
 
     # Capture writes instead of opening a socket
@@ -188,8 +185,7 @@ async def test_adapter_mixed_flow():
     def workspace_for(sid: str) -> Path:
         return settings.workspace_root / sid
 
-    settings.env.update({"WECOM_BOT_ID": "BOT", "WECOM_SECRET": "S"})
-    adapter = WeComBotAdapter(settings, workspace_resolver=workspace_for)
+    adapter = WeComBotAdapter(settings, workspace_resolver=workspace_for, bot_id="BOT", secret="S")
     adapter.set_handler(handler)
 
     async def fake_enqueue(payload):
@@ -237,9 +233,7 @@ async def test_adapter_mixed_flow():
 async def test_event_flow():
     print("== test 5: enter_chat → welcome frame; disconnected → stop ==")
     settings = load_settings()
-    settings.env.update({"WECOM_BOT_ID": "BOT", "WECOM_SECRET": "S"})
-
-    adapter = WeComBotAdapter(settings)
+    adapter = WeComBotAdapter(settings, bot_id="BOT", secret="S")
     adapter.set_handler(lambda *a, **k: asyncio.sleep(0))
 
     sent: list[dict] = []
@@ -287,7 +281,6 @@ async def test_welcome_matches_persisted_current_role():
     print("== test 5b: enter_chat welcome uses session's current_role, not default ==")
     import json as _json
     settings = load_settings()
-    settings.env.update({"WECOM_BOT_ID": "BOT", "WECOM_SECRET": "S"})
 
     # Seed a non-default role with its own welcome_message.
     role_path = settings.paths.user_roles_dir / "engineer.yaml"
@@ -319,7 +312,7 @@ async def test_welcome_matches_persisted_current_role():
     def workspace_for(sid):
         return settings.workspace_root / sid
 
-    adapter = WeComBotAdapter(settings, workspace_resolver=workspace_for)
+    adapter = WeComBotAdapter(settings, workspace_resolver=workspace_for, bot_id="BOT", secret="S")
     sent: list[dict] = []
     async def fake_enqueue(p):
         sent.append(p)
@@ -374,12 +367,10 @@ def _build_quote_adapter(settings, cipher_by_url):
     def restore():
         wecom_media.download_and_decrypt = real_dl
 
-    settings.env.update({"WECOM_BOT_ID": "BOT", "WECOM_SECRET": "S"})
-
     def workspace_for(sid):
         return settings.workspace_root / sid
 
-    adapter = WeComBotAdapter(settings, workspace_resolver=workspace_for)
+    adapter = WeComBotAdapter(settings, workspace_resolver=workspace_for, bot_id="BOT", secret="S")
 
     async def fake_enqueue(payload):
         pass

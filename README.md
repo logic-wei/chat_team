@@ -54,8 +54,7 @@ pip install -e .
 
 ```
 ~/.chat_team/
-  config.yaml      # 全局参数 (token 预算、shell 超时、日志轮转……)
-  .env             # 凭证 (mode 0600);WECOM_BOT_ID / WECOM_SECRET / OPENAI_*
+  config.yaml      # 全局参数 + 凭证 (chmod 0600);首次启动自动生成
   team.md          # 全局团队画像;非空时每轮注入到所有员工的 system prompt;改后需重启
   roles/           # 用户自定义角色 YAML,同名优先于内置
   workspaces/      # 每个会话一个子目录
@@ -63,14 +62,19 @@ pip install -e .
   state/           # 跨会话状态保留位
 ```
 
-把企微机器人后台拿到的 BotID / Secret 和 OpenAI 密钥填进 `~/.chat_team/.env`:
+把企微机器人后台拿到的 BotID / Secret 和 OpenAI 密钥填进 `~/.chat_team/config.yaml`:
 
-```bash
-WECOM_BOT_ID=...
-WECOM_SECRET=...
-OPENAI_API_KEY=...
-OPENAI_BASE_URL=https://api.openai.com/v1   # 替换成内部代理 / vLLM / Ollama 网关也行
+```yaml
+bots:
+  - bot_id: "..."
+    secret: "..."
+
+llm:
+  api_key: "sk-..."
+  base_url: "https://api.openai.com/v1"   # 替换成内部代理 / vLLM / Ollama 网关也行
 ```
+
+凭证也可通过同名环境变量设置（`WECOM_BOT_ID` / `WECOM_SECRET` / `OPENAI_API_KEY` / `OPENAI_BASE_URL`），config.yaml 中的值优先。
 
 测试时可用 `CHAT_TEAM_HOME=/tmp/chat_team_dev` 把整个根目录搬走,避免污染真实环境。
 
@@ -183,7 +187,7 @@ chat-team-boss
 - **改完即可**:`Ctrl+D` 或 `/quit` 退出,然后用 `chat-team` 启动主机器人即可生效
   (角色注册表在主进程启动时一次性加载)。
 
-需要 `OPENAI_API_KEY`(同主机器人,从 `~/.chat_team/.env` 读)。
+需要 `OPENAI_API_KEY`（同主机器人,从 `~/.chat_team/config.yaml` 的 `llm.api_key` 或环境变量读取）。
 
 ## 看可用工具清单
 

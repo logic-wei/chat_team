@@ -1,4 +1,4 @@
-"""Load configuration from ``~/.chat_team/config.yaml`` and ``~/.chat_team/.env``."""
+"""Load configuration from ``~/.chat_team/config.yaml``."""
 from __future__ import annotations
 
 import logging
@@ -67,67 +67,17 @@ class CleanupConfig:
 @dataclass
 class LLMConfig:
     provider: str = "openai"
+    api_key: str = ""
+    base_url: str = ""
     chat: "LLMChatConfig" = field(default_factory=lambda: LLMChatConfig())
     vision: "LLMVisionConfig" = field(default_factory=lambda: LLMVisionConfig())
-    # When true, every OpenAI provider call writes a JSON file to
-    # <workspace>/.chat_team/llm/ recording the request payload (with
-    # base64 image data URIs redacted), the response, token usage, and
-    # latency. Off by default — turn on per-install for debugging; do
-    # NOT enable in production (one file per call adds up fast and
-    # transcripts can contain sensitive user content).
     debug_log_enabled: bool = False
-    # When true, record every outbound HTTP request for LLM calls (headers
-    # + full body) to per-session JSON files under <workspace>/.chat_team/
-    # llm_http/. Includes sensitive fields (for example Authorization).
-    # Keep OFF in production; use only for short local debugging windows.
     http_debug_log_enabled: bool = False
-    # When true, provider uses OpenAI streaming under the hood and assembles
-    # the final assistant message from chunks. This keeps long calls alive as
-    # long as bytes keep arriving, reducing read-timeout failures near the
-    # first token boundary.
     use_streaming: bool = True
-    # Hard ceiling on a single OpenAI request. Without this the AsyncOpenAI
-    # client waits forever, and since the dispatcher holds session.lock for
-    # the duration of a turn a hung request deadlocks the whole session.
     request_timeout_seconds: float = 60.0
-    # Total attempts (including the first) for a single LLM call. Retry is
-    # triggered only by transient errors: RateLimitError, APITimeoutError,
-    # APIConnectionError, InternalServerError. 4xx other than 429 still raises
-    # immediately.
     max_retries: int = 3
-    # Base delay before the second attempt; doubled each retry with up to
-    # 0.5s of random jitter on top to avoid thundering-herd reconnects.
     retry_initial_delay: float = 1.0
-    # Max LLM↔tool round-trips inside a single turn before the agent gives
-    # up and returns a fuse message. Skill-driven flows (load SKILL.md →
-    # write script → `uv run` → re-read failure → fix deps → re-run → …)
-    # routinely need more than the previous fixed cap of 8.
     max_tool_loops_per_turn: int = 16
-
-    # ---- backward-compatible aliases (for existing call sites/tests) ----
-    @property
-    def default_model(self) -> str:
-        return self.chat.model
-
-    @property
-    def default_temperature(self) -> float:
-        return self.chat.temperature
-
-    @property
-    def default_history_token_budget(self) -> int:
-        return self.chat.history_token_budget
-
-    @property
-    def default_image_detail(self) -> str:
-        return self.vision.image_detail
-
-    @property
-    def default_vision_strategy(self) -> str:
-        return self.vision.strategy
-
-    @property
-    def default_vision_model(self) -> str:
-        return self.vision.model
 
 
 @dataclass
@@ -142,14 +92,12 @@ class LLMChatConfig:
 
 @dataclass
 class LLMVisionConfig:
-    # Empty means "reuse chat model".
     model: str = ""
-    # Vision handling strategy: "tool" converts images to placeholders;
-    # "direct" passes image blocks to the provider.
     strategy: str = "tool"
-    image_detail: str = "high"            # "low" | "high" | "auto"
-    # Optional reasoning depth for vision calls (describe_image, OCR-ish flows).
+    image_detail: str = "high"
     reasoning_effort: str = ""
+    api_key: str = ""
+    base_url: str = ""
 
 
 @dataclass
@@ -165,10 +113,10 @@ class McpConfig:
 
 @dataclass
 class BotConfig:
-    """One bot in solo mode: maps a WeCom bot_id to exactly one role."""
-    name: str
+    """One WeCom bot entry. Solo mode requires ``name`` (= role); team mode doesn't."""
     bot_id: str
     secret: str
+    name: str = ""
 
 
 @dataclass
@@ -187,10 +135,6 @@ class Settings:
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
     team_profile: str = ""
-    env: dict[str, str] = field(default_factory=dict)
-
-    def get_env(self, key: str, default: str | None = None) -> str | None:
-        return self.env.get(key) or os.environ.get(key) or default
 
 
 def _coerce(target: Any, data: dict[str, Any]) -> None:
@@ -218,11 +162,11 @@ def load_settings(paths: Paths | None = None) -> Settings:
     bots: list[BotConfig] = []
     if isinstance(raw.get("bots"), list):
         for b in raw["bots"]:
-            if isinstance(b, dict) and b.get("name") and b.get("bot_id") and b.get("secret"):
+            if isinstance(b, dict) and b.get("bot_id") and b.get("secret"):
                 bots.append(BotConfig(
-                    name=str(b["name"]),
                     bot_id=str(b["bot_id"]),
                     secret=str(b["secret"]),
+                    name=str(b.get("name", "")),
                 ))
 
     settings = Settings(
@@ -242,36 +186,10 @@ def load_settings(paths: Paths | None = None) -> Settings:
     if isinstance(raw.get("llm"), dict):
         llm_raw = raw["llm"]
         assert isinstance(llm_raw, dict)
-        # Shared llm runtime knobs (provider/retry/timeout/debug/etc).
         _coerce(settings.llm, {
             k: v for k, v in llm_raw.items()
-            if k not in {
-                "chat", "vision",
-                # legacy flat aliases handled below
-                "default_model", "default_temperature", "default_history_token_budget",
-                "default_vision_model", "default_image_detail", "default_vision_strategy",
-                "default_chat_reasoning_effort", "default_vision_reasoning_effort",
-            }
+            if k not in {"chat", "vision"}
         })
-        # Legacy flat keys (backward compatibility).
-        if "default_model" in llm_raw:
-            settings.llm.chat.model = llm_raw["default_model"]
-        if "default_temperature" in llm_raw:
-            settings.llm.chat.temperature = llm_raw["default_temperature"]
-        if "default_history_token_budget" in llm_raw:
-            settings.llm.chat.history_token_budget = llm_raw["default_history_token_budget"]
-        if "default_vision_model" in llm_raw:
-            settings.llm.vision.model = llm_raw["default_vision_model"]
-        if "default_image_detail" in llm_raw:
-            settings.llm.vision.image_detail = llm_raw["default_image_detail"]
-        if "default_vision_strategy" in llm_raw:
-            settings.llm.vision.strategy = llm_raw["default_vision_strategy"]
-        if "default_chat_reasoning_effort" in llm_raw:
-            settings.llm.chat.reasoning_effort = llm_raw["default_chat_reasoning_effort"]
-        if "default_vision_reasoning_effort" in llm_raw:
-            settings.llm.vision.reasoning_effort = llm_raw["default_vision_reasoning_effort"]
-
-        # New nested layout: llm.chat / llm.vision.
         if isinstance(llm_raw.get("chat"), dict):
             _coerce(settings.llm.chat, llm_raw["chat"])
         if isinstance(llm_raw.get("vision"), dict):
@@ -302,10 +220,14 @@ def load_settings(paths: Paths | None = None) -> Settings:
                     _log.warning("skipping invalid mcp server %r", srv_name, exc_info=True)
             settings.mcp = McpConfig(servers=mcp_servers)
 
-    settings.env = {
-        k: v for k, v in os.environ.items()
-        if k.startswith(("WECOM_", "OPENAI_", "CHAT_TEAM_"))
-    }
+    # Backward compat: if no bots configured in YAML, auto-construct one
+    # from WECOM_BOT_ID / WECOM_SECRET env vars (loaded from .env above).
+    if not settings.bots:
+        env_bot_id = os.environ.get("WECOM_BOT_ID", "")
+        env_secret = os.environ.get("WECOM_SECRET", "")
+        if env_bot_id and env_secret:
+            settings.bots = [BotConfig(bot_id=env_bot_id, secret=env_secret)]
+
     if paths.team_md.exists():
         settings.team_profile = paths.team_md.read_text(encoding="utf-8").strip()
     workspace_root.mkdir(parents=True, exist_ok=True)

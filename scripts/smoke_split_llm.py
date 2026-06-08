@@ -82,8 +82,7 @@ class _FakeSession:
 def test_vision_provider_same_instance_when_creds_identical():
     print("== test 1: same creds → same LLMProvider instance ==")
     settings = load_settings()
-    # No vision-specific config in settings; env has only OPENAI_API_KEY.
-    # Both should resolve to the same key/url.
+    settings.llm.api_key = "sk-test-main"
     main_llm = OpenAIChatCompletionProvider(api_key="sk-test-main")
     vision_llm = build_vision_llm_provider(settings, main_llm)
     assert vision_llm is main_llm, (
@@ -96,32 +95,27 @@ def test_vision_provider_same_instance_when_creds_identical():
 # Test 2: build_vision_llm_provider returns NEW instance when creds differ
 # ─────────────────────────────────────────────────────────────────────────────
 def test_vision_provider_new_instance_when_creds_differ():
-    print("== test 2: different creds (via env) → new LLMProvider instance ==")
-    old = os.environ.pop("OPENAI_VISION_API_KEY", None)
-    try:
-        os.environ["OPENAI_VISION_API_KEY"] = "sk-vision-special"
-        settings = load_settings()
-        main_llm = OpenAIChatCompletionProvider(api_key="sk-test-main")
-        vision_llm = build_vision_llm_provider(settings, main_llm)
-        assert vision_llm is not main_llm, "expected a new instance for different vision key"
-        assert isinstance(vision_llm, OpenAIChatCompletionProvider)
-        print("  ✓ returns new OpenAIChatCompletionProvider when vision key differs")
-    finally:
-        if old is None:
-            os.environ.pop("OPENAI_VISION_API_KEY", None)
-        else:
-            os.environ["OPENAI_VISION_API_KEY"] = old
+    print("== test 2: different creds (via config) → new LLMProvider instance ==")
+    settings = load_settings()
+    settings.llm.api_key = "sk-test-main"
+    settings.llm.vision.api_key = "sk-vision-special"
+    main_llm = OpenAIChatCompletionProvider(api_key="sk-test-main")
+    vision_llm = build_vision_llm_provider(settings, main_llm)
+    assert vision_llm is not main_llm, "expected a new instance for different vision key"
+    assert isinstance(vision_llm, OpenAIChatCompletionProvider)
+    print("  ✓ returns new OpenAIChatCompletionProvider when vision key differs")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 3: OPENAI_VISION_API_KEY env var also causes a split
 # ─────────────────────────────────────────────────────────────────────────────
 def test_vision_provider_env_var_causes_split():
-    print("== test 3: OPENAI_VISION_API_KEY env var → new instance ==")
+    print("== test 3: OPENAI_VISION_API_KEY env var fallback → new instance ==")
     old = os.environ.pop("OPENAI_VISION_API_KEY", None)
     try:
         os.environ["OPENAI_VISION_API_KEY"] = "sk-env-vision"
         settings = load_settings()
+        settings.llm.api_key = "sk-test-main"
         main_llm = OpenAIChatCompletionProvider(api_key="sk-test-main")
         vision_llm = build_vision_llm_provider(settings, main_llm)
         assert vision_llm is not main_llm, "env var vision key should cause new instance"

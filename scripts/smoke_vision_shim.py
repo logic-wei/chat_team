@@ -4,7 +4,7 @@
 * tool mode + plain string → unchanged, no LLM call
 * tool mode + text-only list → flattened to string, no LLM call
 * direct mode + [text, image] → list returned unchanged, no LLM call
-* role.llm.vision_strategy overrides settings.llm.default_vision_strategy
+* role.llm.vision_strategy overrides settings.llm.vision.strategy
 * repeated tool-mode calls never invoke LLM
 """
 from __future__ import annotations
@@ -163,7 +163,7 @@ async def test_role_overrides_settings_default():
     print("== test 5: role.llm.vision_strategy overrides settings default ==")
     settings = load_settings()
     # Settings default is "tool"; role explicitly says "direct"
-    assert settings.llm.default_vision_strategy == "tool"
+    assert settings.llm.vision.strategy == "tool"
     role = _role("forced_direct", vs="direct")
     assert resolve_vision_strategy(role, settings) == "direct"
     role2 = _role("default_role", vs=None)
