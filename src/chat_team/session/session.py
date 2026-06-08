@@ -39,6 +39,7 @@ class Session:
     # Histories loaded from disk on startup; consumed by Dispatcher when an
     # Agent for that role is first instantiated this session.
     restored_histories: dict[str, list["ChatMessage"]] = field(default_factory=dict)
+    state_filename: str = "session.json"
 
     def reset_turn_counters(self) -> None:
         self.transfer_count_this_turn = 0

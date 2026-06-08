@@ -164,10 +164,20 @@ class McpConfig:
 
 
 @dataclass
+class BotConfig:
+    """One bot in solo mode: maps a WeCom bot_id to exactly one role."""
+    name: str
+    bot_id: str
+    secret: str
+
+
+@dataclass
 class Settings:
     paths: Paths
     workspace_root: Path
     default_role: str = "team_admin"
+    mode: str = "team"  # "team" (multi-role transfer) | "solo" (one bot = one role)
+    bots: list[BotConfig] = field(default_factory=list)
     log_level: str = "INFO"
     session: SessionConfig = field(default_factory=SessionConfig)
     notebook: NotebookConfig = field(default_factory=NotebookConfig)
@@ -204,10 +214,23 @@ def load_settings(paths: Paths | None = None) -> Settings:
     if not workspace_root.is_absolute():
         workspace_root = paths.home / workspace_root
 
+    mode = raw.get("mode", "team")
+    bots: list[BotConfig] = []
+    if isinstance(raw.get("bots"), list):
+        for b in raw["bots"]:
+            if isinstance(b, dict) and b.get("name") and b.get("bot_id") and b.get("secret"):
+                bots.append(BotConfig(
+                    name=str(b["name"]),
+                    bot_id=str(b["bot_id"]),
+                    secret=str(b["secret"]),
+                ))
+
     settings = Settings(
         paths=paths,
         workspace_root=workspace_root,
         default_role=raw.get("default_role", "team_admin"),
+        mode=mode,
+        bots=bots,
         log_level=raw.get("log_level", "INFO"),
     )
     if isinstance(raw.get("session"), dict):

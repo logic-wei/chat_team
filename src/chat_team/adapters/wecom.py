@@ -180,10 +180,15 @@ class WeComBotAdapter(BotAdapter):
         self,
         settings: Settings,
         workspace_resolver: WorkspaceResolver | None = None,
+        *,
+        bot_id: str | None = None,
+        secret: str | None = None,
+        role_name: str | None = None,
     ):
         self.settings = settings
-        self.bot_id = settings.get_env("WECOM_BOT_ID") or ""
-        self.secret = settings.get_env("WECOM_SECRET") or ""
+        self.bot_id = bot_id or settings.get_env("WECOM_BOT_ID") or ""
+        self.secret = secret or settings.get_env("WECOM_SECRET") or ""
+        self.role_name = role_name
         self._handler: MessageHandler | None = None
         # Per-adapter (lifetime) state ----------------------------------
         # ``_msgid_lru`` survives across reconnects so server-side replays
@@ -785,20 +790,24 @@ class WeComBotAdapter(BotAdapter):
         from ..roles.registry import RoleRegistry
         from ..session.persistence import load_state
         roles = RoleRegistry.load(self.settings.paths.user_roles_dir)
-        # Pick whichever role the user will *actually* talk to next: the
-        # persisted current_role for this session if any, otherwise the
-        # global default. Without this, a returning user sees admin's
-        # "我是小管" while their messages still route to e.g. engineer.
-        role_name = self.settings.default_role
-        if session_id and self._workspace_resolver is not None:
-            try:
-                cwd = self._workspace_resolver(session_id)
-                state = load_state(cwd)
-            except Exception:                                # noqa: BLE001
-                state = None
-            prior_role = (state or {}).get("current_role")
-            if prior_role and roles.has(prior_role):
-                role_name = prior_role
+        # Solo mode: always use the pinned role.
+        if self.role_name and roles.has(self.role_name):
+            role_name = self.role_name
+        else:
+            # Pick whichever role the user will *actually* talk to next: the
+            # persisted current_role for this session if any, otherwise the
+            # global default. Without this, a returning user sees admin's
+            # "我是小管" while their messages still route to e.g. engineer.
+            role_name = self.settings.default_role
+            if session_id and self._workspace_resolver is not None:
+                try:
+                    cwd = self._workspace_resolver(session_id)
+                    state = load_state(cwd)
+                except Exception:                                # noqa: BLE001
+                    state = None
+                prior_role = (state or {}).get("current_role")
+                if prior_role and roles.has(prior_role):
+                    role_name = prior_role
         welcome = ""
         if roles.has(role_name):
             welcome = (roles.get(role_name).welcome_message or "").strip()

@@ -47,8 +47,11 @@ class SessionManager:
         self,
         settings: Settings,
         persistence: "PersistenceManager | None" = None,
+        *,
+        solo_role: str | None = None,
     ):
         self.settings = settings
+        self._solo_role = solo_role
         self._sessions: "OrderedDict[str, Session]" = OrderedDict()
         # Optional — only used to force a synchronous flush before evicting
         # an LRU entry. SessionManager works without it (the eviction just
@@ -114,9 +117,15 @@ class SessionManager:
 
         notebook = Notebook(meta / "notebook.md", max_bytes=self.settings.notebook.max_bytes)
 
-        prior = load_state(cwd) or {}
-        current_role = prior.get("current_role") or self.settings.default_role
-        prior_histories = restored_histories(cwd)
+        if self._solo_role:
+            state_filename = f"session-{self._solo_role}.json"
+            current_role = self._solo_role
+            prior_histories = restored_histories(cwd, state_filename)
+        else:
+            state_filename = "session.json"
+            prior = load_state(cwd) or {}
+            current_role = prior.get("current_role") or self.settings.default_role
+            prior_histories = restored_histories(cwd)
 
         return Session(
             session_id=session_id,
@@ -124,6 +133,7 @@ class SessionManager:
             current_role=current_role,
             notebook=notebook,
             restored_histories=prior_histories,
+            state_filename=state_filename,
         )
 
     async def _evict_if_needed(self) -> None:

@@ -35,6 +35,7 @@ class Dispatcher:
         skills: SkillRegistry | None = None,
         persistence: PersistenceManager | None = None,
         vision_llm: LLMProvider | None = None,
+        fixed_role: str | None = None,
     ):
         self.settings = settings
         self.sessions = sessions
@@ -46,6 +47,8 @@ class Dispatcher:
         # Separate provider for vision/OCR calls (describe_image tool).
         # Falls back to self.llm when not set.
         self._vision_llm = vision_llm
+        # Solo mode: pin to a single role, skip transfer loop.
+        self._fixed_role = fixed_role
 
     async def handle(self, msg: IncomingMessage, stream: StreamHandle) -> None:
         session = await self.sessions.get_or_create(msg.session_id)
@@ -141,6 +144,8 @@ class Dispatcher:
         user_content,
         stream: StreamHandle,
     ) -> str:
+        if self._fixed_role:
+            return await self._run_turn_solo(session, user_content, stream)
         cap = self.settings.session.per_turn_transfer_cap
         original_content = user_content
         while True:
@@ -192,6 +197,35 @@ class Dispatcher:
                 )
                 session.current_role = t.target
                 # loop again with the new role and the same user_text
+
+    async def _run_turn_solo(
+        self,
+        session: Session,
+        user_content,
+        stream: StreamHandle,
+    ) -> str:
+        session.current_role = self._fixed_role  # type: ignore[assignment]
+        agent = self._agent_for(session, self._fixed_role)  # type: ignore[arg-type]
+        transformed = await apply_vision_strategy(
+            user_content,
+            role=agent.role,
+            settings=self.settings,
+            llm=self._vision_llm or self.llm,
+            cwd=session.cwd,
+            session_id=session.session_id,
+        )
+        try:
+            return await agent.handle(transformed, stream)
+        except TransferRequested:
+            log.warning(
+                "session %s: transfer attempted in solo mode; ignoring",
+                session.session_id,
+            )
+            agent.queue_system_note("[系统] 当前为独立模式,无法转接给其他员工,请直接回答用户。")
+            return await agent.handle(
+                "(系统提示: 当前为独立模式,请直接回答用户的提问。)",
+                stream,
+            )
 
     def _apply_pending_handoff(self, agent: Agent, session: Session) -> None:
         if not session.pending_handoff:

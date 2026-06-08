@@ -76,8 +76,8 @@ def _deserialize_message(d: dict[str, Any]) -> ChatMessage:
     )
 
 
-def _state_path(cwd: Path) -> Path:
-    return cwd / ".chat_team" / STATE_FILENAME
+def _state_path(cwd: Path, filename: str = STATE_FILENAME) -> Path:
+    return cwd / ".chat_team" / filename
 
 
 # ---- snapshot / write / load ----------------------------------------------
@@ -95,15 +95,15 @@ def snapshot(session: "Session") -> dict[str, Any]:
     }
 
 
-def write_atomic(cwd: Path, data: dict[str, Any]) -> None:
-    target = _state_path(cwd)
+def write_atomic(cwd: Path, data: dict[str, Any], filename: str = STATE_FILENAME) -> None:
+    target = _state_path(cwd, filename)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False, indent=2)
     with tempfile.NamedTemporaryFile(
         "w",
         encoding="utf-8",
         dir=str(target.parent),
-        prefix=f".{STATE_FILENAME}.",
+        prefix=f".{filename}.",
         suffix=".tmp",
         delete=False,
     ) as tmp:
@@ -112,8 +112,8 @@ def write_atomic(cwd: Path, data: dict[str, Any]) -> None:
     os.replace(tmp_path, target)
 
 
-def load_state(cwd: Path) -> dict[str, Any] | None:
-    target = _state_path(cwd)
+def load_state(cwd: Path, filename: str = STATE_FILENAME) -> dict[str, Any] | None:
+    target = _state_path(cwd, filename)
     if not target.exists():
         return None
     try:
@@ -123,8 +123,8 @@ def load_state(cwd: Path) -> dict[str, Any] | None:
         return None
 
 
-def restored_histories(cwd: Path) -> dict[str, list[ChatMessage]]:
-    state = load_state(cwd)
+def restored_histories(cwd: Path, filename: str = STATE_FILENAME) -> dict[str, list[ChatMessage]]:
+    state = load_state(cwd, filename)
     if not state:
         return {}
     out: dict[str, list[ChatMessage]] = {}
@@ -164,8 +164,9 @@ class PersistenceManager:
         delay = self.settings.session.persistence_debounce_seconds
         snap = snapshot(session)
         cwd = session.cwd
+        filename = session.state_filename
         self._pending[sid] = asyncio.create_task(
-            self._delayed_flush(sid, cwd, snap, delay)
+            self._delayed_flush(sid, cwd, snap, delay, filename)
         )
 
     async def _delayed_flush(
@@ -174,18 +175,19 @@ class PersistenceManager:
         cwd: Path,
         snap: dict[str, Any],
         delay: float,
+        filename: str = STATE_FILENAME,
     ) -> None:
         try:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
         try:
-            await asyncio.to_thread(write_atomic, cwd, snap)
+            await asyncio.to_thread(write_atomic, cwd, snap, filename)
         except Exception:                                     # noqa: BLE001
             log.exception("debounced flush failed for %s", session_id)
 
     def flush_now(self, session: "Session") -> None:
-        write_atomic(session.cwd, snapshot(session))
+        write_atomic(session.cwd, snapshot(session), session.state_filename)
 
     async def flush_all(self, sessions: list["Session"]) -> None:
         tasks = [t for t in self._pending.values() if not t.done()]

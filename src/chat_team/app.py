@@ -43,6 +43,8 @@ def build_tool_registry(
     roles: RoleRegistry,
     skills: SkillRegistry | None = None,
     extra_tools: list[Tool] | None = None,
+    *,
+    include_transfer: bool = True,
 ) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(ReadFileTool())
@@ -58,7 +60,8 @@ def build_tool_registry(
     reg.register(SendImageTool())
     reg.register(SendFileTool())
     reg.register(DescribeImageTool())
-    reg.register(TransferToEmployeeTool(available_employees=roles.names()))
+    if include_transfer:
+        reg.register(TransferToEmployeeTool(available_employees=roles.names()))
     if skills is not None and skills.names():
         reg.register(SkillTool(skills=skills, roles=roles))
         reg.register(SkillReadFileTool(skills=skills, roles=roles))
@@ -177,12 +180,68 @@ def configure_logging(settings: Settings) -> None:
     )
 
 
+async def _run_solo(
+    settings: Settings,
+    mcp_tools: list[Tool],
+    mcp_manager,
+    adapter_factory,
+) -> None:
+    """Solo mode: one process, N bots, each pinned to one role."""
+    if not settings.bots:
+        raise RuntimeError("mode=solo but no bots configured in config.yaml")
+
+    roles = RoleRegistry.load(settings.paths.user_roles_dir)
+    skills = SkillRegistry.load(settings.paths.user_skills_dir)
+    warn_if_uv_missing(roles)
+    llm = build_llm_provider(settings)
+    vision_llm = build_vision_llm_provider(settings, llm)
+    persistence = PersistenceManager(settings)
+
+    adapters: list[tuple[BotAdapter, Dispatcher]] = []
+    for bot_cfg in settings.bots:
+        if not roles.has(bot_cfg.name):
+            raise RuntimeError(
+                f"solo bot '{bot_cfg.name}' references unknown role; "
+                f"available: {roles.names()}"
+            )
+        tools = build_tool_registry(
+            roles, skills, extra_tools=mcp_tools, include_transfer=False,
+        )
+        sessions = SessionManager(
+            settings, persistence=persistence, solo_role=bot_cfg.name,
+        )
+        dispatcher = Dispatcher(
+            settings, sessions, roles, tools, llm,
+            skills=skills, persistence=persistence,
+            vision_llm=vision_llm, fixed_role=bot_cfg.name,
+        )
+        adapter: BotAdapter = adapter_factory(
+            settings, sessions.workspace_for,
+            bot_id=bot_cfg.bot_id, secret=bot_cfg.secret,
+            role_name=bot_cfg.name,
+        )
+        adapter.set_handler(dispatcher.handle)
+        adapters.append((adapter, dispatcher))
+        log.info("solo bot '%s' configured (bot_id=%s)", bot_cfg.name, bot_cfg.bot_id[:8] + "...")
+
+    try:
+        await asyncio.gather(*[a.run_forever() for a, _ in adapters])
+    finally:
+        for a, _ in adapters:
+            await a.close()
+        all_sessions: list = []
+        for _, d in adapters:
+            all_sessions.extend(d.sessions.all_sessions())
+        await persistence.flush_all(all_sessions)
+        await mcp_manager.close_all()
+
+
 async def _async_main(adapter_factory) -> None:
     from .mcp.client import McpClientManager
 
     settings = load_settings()
     configure_logging(settings)
-    log.info("chat_team starting; home=%s", settings.paths.home)
+    log.info("chat_team starting; home=%s mode=%s", settings.paths.home, settings.mode)
 
     mcp_manager = McpClientManager()
     mcp_tools: list[Tool] = []
@@ -193,6 +252,10 @@ async def _async_main(adapter_factory) -> None:
             len(mcp_tools),
             len(settings.mcp.servers),
         )
+
+    if settings.mode == "solo":
+        await _run_solo(settings, mcp_tools, mcp_manager, adapter_factory)
+        return
 
     dispatcher = build_dispatcher(settings, extra_tools=mcp_tools)
     adapter: BotAdapter = adapter_factory(settings, dispatcher.sessions.workspace_for)

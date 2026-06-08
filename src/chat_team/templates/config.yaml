@@ -8,6 +8,15 @@ workspace_root: workspaces           # one subdirectory per chat session
 default_role: team_admin             # role that handles a brand-new session
 log_level: INFO                      # DEBUG / INFO / WARNING / ERROR
 
+# mode: solo                         # "team"(默认,多角色互相转接) | "solo"(一 bot 一角色)
+# bots:                              # solo 模式:每个 bot 绑定一个角色,共享 notebook
+#   - name: research_engineer        # 必须匹配 roles/ 下的角色名
+#     bot_id: "YOUR_BOT_ID_1"
+#     secret: "YOUR_SECRET_1"
+#   - name: customer_service
+#     bot_id: "YOUR_BOT_ID_2"
+#     secret: "YOUR_SECRET_2"
+
 session:
   msgid_lru_size: 500                # WeCom callback dedup window
   persistence_debounce_seconds: 10   # session.json flush debounce
