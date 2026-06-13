@@ -30,6 +30,7 @@ from .agent.tools.transfer_tool import TransferToEmployeeTool
 from .config import Settings, load_settings
 from .dispatcher import Dispatcher
 from .llm.base import LLMProvider
+from .llm.image_cache import configure_default_cache
 from .llm.openai_provider import OpenAIChatCompletionProvider
 from .roles.registry import RoleRegistry
 from .session.manager import SessionManager
@@ -204,6 +205,13 @@ async def _run_solo(
     if not settings.bots:
         raise RuntimeError("mode=solo but no bots configured in config.yaml")
 
+    configure_default_cache(
+        max_inline_bytes=settings.llm.vision.max_inline_bytes,
+        oversized_image=settings.llm.vision.oversized_image,
+        resize_long_side=settings.llm.vision.resize_long_side,
+        resize_quality=settings.llm.vision.resize_quality,
+    )
+
     roles = RoleRegistry.load(settings.paths.user_roles_dir)
     skills = SkillRegistry.load(settings.paths.user_skills_dir)
     warn_if_uv_missing(roles)
@@ -255,6 +263,12 @@ async def _async_main(adapter_factory) -> None:
 
     settings = load_settings()
     configure_logging(settings)
+    configure_default_cache(
+        max_inline_bytes=settings.llm.vision.max_inline_bytes,
+        oversized_image=settings.llm.vision.oversized_image,
+        resize_long_side=settings.llm.vision.resize_long_side,
+        resize_quality=settings.llm.vision.resize_quality,
+    )
     log.info("chat_team starting; home=%s mode=%s", settings.paths.home, settings.mode)
 
     mcp_manager = McpClientManager()

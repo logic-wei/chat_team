@@ -17,6 +17,7 @@ dependencies = [
     "cryptography>=42",     # for AES decrypt of media URLs
     "mcp>=1.0",             # MCP client for external tool servers
     "textual>=1.0",         # TUI for boss CLI
+    "Pillow>=10",           # image resize for oversized vision payloads
 ]
 
 [project.scripts]

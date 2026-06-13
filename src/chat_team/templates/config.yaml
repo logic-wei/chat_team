@@ -63,6 +63,10 @@ llm:
     strategy: tool                   # tool | direct
     image_detail: high               # vision tile granularity: low | high | auto
     # reasoning_effort: ""           # optional: low | medium | high (empty = provider default)
+    max_inline_bytes: 6291456        # 6 MB; 超过此大小的图片触发 oversized_image 策略
+    oversized_image: resize          # resize (自动缩放) | reject (降级为占位符)
+    resize_long_side: 2048           # 缩放后最长边像素数
+    resize_quality: 85               # JPEG 重编码质量 (1-95, 推荐 85)
   debug_log_enabled: false           # write one JSON per LLM call to <workspace>/.chat_team/llm/
   http_debug_log_enabled: false      # write JSON logs for LLM HTTP requests (contains sensitive data)
   use_streaming: true                # use provider-side streaming

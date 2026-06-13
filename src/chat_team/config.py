@@ -98,6 +98,14 @@ class LLMVisionConfig:
     reasoning_effort: str = ""
     api_key: str = ""
     base_url: str = ""
+    # Image size limits and resize behaviour for vision payloads.
+    # When a raw image exceeds max_inline_bytes:
+    #   "resize" → auto downscale + re-encode as JPEG (default)
+    #   "reject" → replace with [图:xxx(过大,已省略)] placeholder
+    max_inline_bytes: int = 6 * 1024 * 1024       # 6 MB raw file size ceiling
+    oversized_image: str = "resize"                # resize | reject
+    resize_long_side: int = 2048                   # max pixel dimension after resize
+    resize_quality: int = 85                       # JPEG quality 1-95
 
 
 @dataclass

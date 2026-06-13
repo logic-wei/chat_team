@@ -163,26 +163,26 @@ async def test_concurrent_order_preserved():
 
 
 async def test_missing_and_oversize_no_llm():
-    print("== test 5: missing/oversize file → '[读取失败]' without LLM ==")
+    print("== test 5: missing/empty file → '[读取失败]' without LLM ==")
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         good = _make_image(d / "inbox", "good.png")
-        big = d / "inbox" / "huge.png"
-        big.write_bytes(b"\x00" * (7 * 1024 * 1024))    # > 6MB cap
         missing = d / "inbox" / "nope.png"
+        empty = d / "inbox" / "empty.png"
+        empty.write_bytes(b"")
         cache = ImageDescriptionCache()
         llm = CountingLLM(lambda i: "ok")
         out = await describe_images(
-            [str(good), str(big), str(missing)],
+            [str(good), str(missing), str(empty)],
             prompt="P", detail="high", llm=llm,
             model="gpt-4o", image_base_dir=str(d), cache=cache,
         )
         assert out[0] == "ok"
-        assert out[1].startswith("[读取失败:") and "过大" in out[1]
-        assert out[2].startswith("[读取失败:") and ("不存在" in out[2] or "无法读取" in out[2])
+        assert out[1].startswith("[读取失败:") and ("不存在" in out[1] or "无法读取" in out[1])
+        assert out[2].startswith("[读取失败:") and "空" in out[2]
         # Only the good image should have triggered an LLM call.
         assert len(llm.calls) == 1, f"expected 1 LLM call (good only), got {len(llm.calls)}"
-        print("  ✓ bad inputs short-circuit to '[读取失败]' without LLM")
+        print("  ✓ missing/empty files short-circuit to '[读取失败]' without LLM")
 
 
 async def test_tool_sandbox_and_format():

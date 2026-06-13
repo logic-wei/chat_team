@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ...llm.base import ChatMessage, CompletionRequest, LLMProvider
-from ...llm.image_cache import MAX_INLINE_BYTES
+from ...llm.image_cache import MAX_INLINE_BYTES, default_cache as image_default_cache
 from ...llm.image_description_cache import ImageDescriptionCache, default_cache
 from .base import Tool, ToolContext, ToolError
 from .file_tools import _resolve_under
@@ -31,15 +31,18 @@ DEFAULT_DESCRIBE_CONCURRENCY = 8
 
 def _read_failure_reason(abs_path: str) -> str | None:
     """Returns a short reason string if the file can't / shouldn't be sent
-    to the vision model; ``None`` if the file is fine."""
+    to the vision model; ``None`` if the file is fine.
+
+    Oversized images are *not* rejected here — the ``ImageDataURICache``
+    handles them by auto-resizing (or the ``reject`` strategy). We only
+    check for missing / empty files.
+    """
     try:
         size = os.path.getsize(abs_path)
     except OSError:
         return "文件不存在或无法读取"
     if size <= 0:
         return "文件为空"
-    if size > MAX_INLINE_BYTES:
-        return f"图片过大 ({size} 字节,上限 {MAX_INLINE_BYTES})"
     return None
 
 
