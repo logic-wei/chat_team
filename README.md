@@ -25,8 +25,9 @@
 - **持久化**:`session.json` debounce 10s 原子刷盘,重启后会话历史和当前在岗员工照旧。
 - **媒体落地**:image / file / video 通过每条消息独立的 AES-256-CBC `aeskey` 解密后
   自动入 `<cwd>/inbox/`,Agent 收到一条文本指针。
-- **图像默认占位符直通**:默认 `vision_strategy=tool` 下,入站图片不会前置 OCR,只注入
-  `[图:相对路径]` 占位符;需要识别时由 `describe_image` 按需批量并发处理。
+- **图像自动前置 OCR**：默认 `vision_strategy=tool` 下，入站图片会**自动前置 OCR**，
+  描述文本以 `[图:相对路径]\n<描述>` 形式注入用户消息，agent 历史保持纯文本，
+  token 消耗可控；仅当角色显式设置 `vision_strategy: direct` 时，原始图片才进入上下文。
 - **Solo 模式**:一 bot 一角色,同进程多 WebSocket 连接;同一群聊的多 bot 共享 notebook,
   对话历史各自隔离(`session-{role}.json`)。
 
@@ -250,6 +251,99 @@ python scripts/smoke_solo.py                      # solo 模式: 独立 dispatch
 
 每个 smoke 都把 `CHAT_TEAM_HOME` 指到 `/tmp/...` 并在启动时 `rmtree`,所以反复跑安全。
 
+## 扩展能力：MCP 与 Skills
+
+### MCP（Model Context Protocol）
+
+无需写 Python 即可接入外部工具服务器。在 `config.yaml` 声明服务器，在角色 YAML 引用，启动时自动发现并注册工具。
+
+**配置示例**（`~/.chat_team/config.yaml`）：
+
+```yaml
+mcp:
+  servers:
+    filesystem:                          # 服务器名，角色 YAML 中引用
+      command: npx                       # stdio transport
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+    github:
+      command: npx
+      args: ["-y", "@modelcontextprotocol/server-github"]
+      env:
+        GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_..."
+    remote_api:
+      url: http://localhost:8080/sse     # SSE transport
+```
+
+Transport 自动推断：有 `command` → stdio，有 `url` → SSE。服务器名须匹配 `[a-zA-Z0-9_-]+` 且不含 `__`。
+
+**角色引用**（角色 YAML）：
+
+```yaml
+name: developer
+tools: [read_file, write_file, run_command, transfer_to_employee]
+mcp_servers: [filesystem, github]        # 该角色可使用这两个服务器的所有工具
+```
+
+MCP 工具注册名为 `mcp__<server>__<tool>`（如 `mcp__filesystem__read_file`），agent 调用时无需感知前缀，直接使用原始工具名即可。
+
+**限制**：当前仅支持 MCP Tools，不支持 Resources / Prompts；修改 MCP 配置需重启 bot；`chat-team-tools` CLI 不列出 MCP 工具（运行时动态发现）。
+
+### Skills（无代码能力包）
+
+通过 drop-in 目录为角色添加指令型能力，无需编写 Python 工具。
+
+**目录结构**：`~/.chat_team/skills/<name>/SKILL.md` + 可选辅助文件。
+
+**SKILL.md 格式**：
+
+```markdown
+---
+name: data_analysis          # 必须等于目录名
+description: SQL 查询与报表生成指南   # 单行描述，注入系统提示 TOC
+---
+
+# 数据分析师 Skill
+
+当用户请求数据分析时，请遵循以下步骤：
+1. 先用 `list_dir` 查看可用数据文件
+2. 使用 `run_command` 执行 pandas 脚本
+...
+```
+
+**角色启用**：在角色 YAML 中同时声明 `skills:` 和 `tools: [skill, skill_read_file]`：
+
+```yaml
+name: data_analyst
+skills: [data_analysis]
+tools: [skill, skill_read_file, read_file, run_command, transfer_to_employee]
+```
+
+Agent 会在系统提示中看到 `[可用 skills] - data_analysis: SQL 查询与报表生成指南`，通过 `skill(name="data_analysis")` 获取完整指令，通过 `skill_read_file(skill="data_analysis", path="template.sql")` 读取辅助文件。
+
+**Python 依赖**：当角色同时拥有 `skill` 和 `run_command` 工具时，系统自动注入 PEP 723 + `uv run` 约定，agent 编写的 Python 脚本可声明内联依赖并由 `uv` 全局缓存解析，不污染宿主环境。未安装 `uv` 时非 Python skill 仍可正常使用。
+
+**注意**：Skill 不支持热加载，新增或修改后需重启 bot。
+
+## 常见问题
+
+- **修改了 `team.md` / 角色 YAML / Skills / MCP 配置为何没生效？**
+  所有配置均在启动时一次性加载，修改后需重启 `chat-team` 才能生效。
+
+- **Solo 模式下 bot 之间如何感知对方更新了 notebook？**
+  当前无主动通知机制。Bot A 写入 notebook 后，Bot B 需在下轮对话中主动调用 `notebook_read` 才能获取最新值。如需强同步，建议在 prompt 中约定关键事实更新后显式提醒对方查阅。
+
+- **MCP 工具调用失败如何排查？**
+  检查 `~/.chat_team/logs/chat_team.log` 中的 WARNING 日志，确认服务器连接状态；若为 stdio transport，检查 `command` 是否可在终端手动执行；若为 SSE，确认 URL 可达且返回合法事件流。
+
+- **图片 OCR 结果不准确怎么办？**
+  默认 eager prompt 优先提取文字。可在 `config.yaml` 中调整 `llm.vision.default_eager_prompt` 自定义 OCR 指令；或对特定图片让 agent 调用 `describe_image` 工具传入定制 prompt 重新识别。
+
+- **Vision `direct` 模式 token 消耗过高？**
+  `direct` 模式将原始图片 base64 注入上下文，单张 1024² 图片约消耗 1600 tokens。建议仅在需要高保真视觉分析（如图表、艺术作品）的角色上启用，并相应调大 `llm.history_token_budget`。
+
+- **`chat-team-tools` 看不到 MCP 工具？**
+  这是预期行为。MCP 工具在运行时动态发现，CLI 仅列出静态注册的内置工具。实际可用工具以 agent 运行时为准。
+
 ## 设计要点
 
 详细架构、不显眼的细节、不要踩的地雷见 [`CLAUDE.md`](./CLAUDE.md)。给 Claude Code 看的,
@@ -262,6 +356,11 @@ python scripts/smoke_solo.py                      # solo 模式: 独立 dispatch
 - **只支持 OpenAI Chat Completion**。Anthropic / Gemini 通过 `LLMProvider` 子类后续扩展。
 - **媒体回传仅支持图片 / 文件**(`send_image` / `send_file` 工具,走
   `aibot_upload_media_init/chunk/finish`);voice / video 暂不支持。
+- **不支持配置热加载**。修改 `team.md`、角色 YAML、Skills、MCP 配置后均需重启 bot 才能生效。
+- **`chat-team-tools` CLI 不列出 MCP 工具**。MCP 工具为运行时动态发现，CLI 仅展示静态注册的内置工具。
+- **Vision `direct` 模式 token 消耗显著高于 `tool` 模式**。原始图片 base64 注入上下文，单张 1024² 图片约 1600 tokens；默认 `tool` 模式因前置 OCR 转为纯文本，token 开销降低约 6 倍。启用 `direct` 时需相应调大 `history_token_budget`。
+- **Solo 模式无跨 bot 主动通知**。notebook 更新后其他 bot 不会自动感知，需依赖 prompt 约定或手动 `notebook_read`。
+- **MCP 仅支持 Tools**。Resources 和 Prompts 暂未实现；单个服务器连接失败仅记 WARNING 并跳过，不阻塞启动，但该角色对应 MCP 工具将不可用。
 
 ## 协议
 
