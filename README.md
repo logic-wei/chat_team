@@ -1,39 +1,30 @@
 # chat_team
 
-企业微信 (WeCom) 智能机器人 —— 支持两种部署模式:
+[中文文档](./README.zh-CN.md)
 
-- **团队模式** (`mode: team`,默认):一个机器人后面隐藏一支可扩展的”虚拟员工团队”,
-  后端按需把会话交接给最合适的角色。
-- **独立模式** (`mode: solo`):一个机器人 = 一个角色,多角色就多个 bot,同一进程内运行,
-  通过共享 notebook 交换信息。
+WeCom (Enterprise WeChat) AI Bot — supports two deployment modes:
 
-**内置只有 `team_admin`**(团队管理员/前台),其他岗位由你按公司业务在
-`~/.chat_team/roles/` 下自己写 YAML 添加 —— `docs/examples/roles/` 下放了
-“研发工程师 / 客服专员”两份示例可以照抄起步。每个会话都有独立工作目录,
-会话之间完全隔离。
+- **Team Mode** (`mode: team`, default): A single bot fronts an extensible "virtual employee team". The backend dynamically transfers sessions to the most appropriate role as needed.
+- **Solo Mode** (`mode: solo`): One bot = one role. Multiple bots run in the same process and share information via a shared notebook.
 
-## 特性
+**Only `team_admin` (receptionist/admin) is built-in.** Other roles are user-defined via YAML files in `~/.chat_team/roles/`. Sample roles (`research_engineer`, `customer_service`) are provided in `docs/examples/roles/` for reference. Each chat session has its own isolated working directory.
 
-- **长连接 (WebSocket) 模式**:无需公网回调地址,启动即在线,自带应用层心跳。
-- **流式回复**:用户先看到“思考中…”占位,过程中持续刷新,最终 `finish=true` 收尾。
-- **角色 = 一份 YAML**:加角色不用改派发代码;放进 `~/.chat_team/roles/` 即可覆盖内置。
-- **会话级工具沙箱**:文件读写 / shell 都被限制在 `~/.chat_team/workspaces/<sid>/` 内,
-  路径穿越、绝对路径、symlink 逃逸全部拒绝;shell 输出超阈值会截断,原文落盘可回查。
-- **共享 notebook**:跨员工的“团队白板”—— Markdown 文件,`## key` 分块,
-  历史里只看到 TOC,值由 `notebook_read` 工具按需取,避免上下文污染。
-- **自动压缩**:每个角色独立 token 预算,超阈值时 LLM 摘要早期消息插回历史头。
-- **持久化**:`session.json` debounce 10s 原子刷盘,重启后会话历史和当前在岗员工照旧。
-- **媒体落地**:image / file / video 通过每条消息独立的 AES-256-CBC `aeskey` 解密后
-  自动入 `<cwd>/inbox/`,Agent 收到一条文本指针。
-- **图像自动前置 OCR**：默认 `vision_strategy=tool` 下，入站图片会**自动前置 OCR**，
-  描述文本以 `[图:相对路径]\n<描述>` 形式注入用户消息，agent 历史保持纯文本，
-  token 消耗可控；仅当角色显式设置 `vision_strategy: direct` 时，原始图片才进入上下文。
-- **Solo 模式**:一 bot 一角色,同进程多 WebSocket 连接;同一群聊的多 bot 共享 notebook,
-  对话历史各自隔离(`session-{role}.json`)。
+## Features
 
-## 安装
+- **WebSocket Long Connection**: No public callback URL required; stays online with application-layer heartbeat.
+- **Streaming Replies**: Users see a "thinking..." placeholder that updates progressively until `finish=true`.
+- **Role = YAML File**: Add roles without modifying dispatch code; place in `~/.chat_team/roles/` to override built-ins.
+- **Session-Level Tool Sandbox**: File I/O and shell commands are restricted to `~/.chat_team/workspaces/<sid>/`. Path traversal, absolute paths, and symlink escapes are rejected. Shell output exceeding thresholds is truncated, with full logs saved for review.
+- **Shared Notebook**: A "team whiteboard" across employees — Markdown file with `## key` blocks. History only sees the TOC; values are fetched on-demand via `notebook_read` to avoid context pollution.
+- **Auto Compaction**: Independent token budget per role. When exceeded, early messages are summarized by LLM and prepended to history.
+- **Persistence**: `session.json` is debounced (10s) and written atomically. Session history and current active role survive restarts.
+- **Media Handling**: Images/files/videos are decrypted using per-message AES-256-CBC keys and saved to `<cwd>/inbox/`. Agents receive text pointers.
+- **Eager Image OCR**: Under default `vision_strategy=tool`, inbound images are **automatically OCR'd upfront**. Descriptions are injected as `[image:relative_path]\n<description>` into user messages, keeping agent history text-only and token consumption predictable. Raw images only enter context when a role explicitly sets `vision_strategy: direct`.
+- **Solo Mode**: One bot per role, multiple WebSocket connections in one process. Bots in the same group chat share a notebook while maintaining isolated conversation histories (`session-{role}.json`).
 
-需要 Python ≥ 3.11。建议在虚拟环境中安装:
+## Installation
+
+Requires Python ≥ 3.11. Recommended to install in a virtual environment:
 
 ```bash
 python3 -m venv .venv
@@ -41,29 +32,25 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-只在 `pyproject.toml` 改动 / 增加非 Python 资源 / 重建 venv 时才需要再次 `pip install -e .`;
-普通改源码不需要重装(editable 安装把 `src/chat_team` 软链进了 `site-packages`)。
+Re-run `pip install -e .` only when modifying `pyproject.toml`, adding non-Python resources, or rebuilding the venv. Source code changes don't require reinstallation (editable install symlinks `src/chat_team` into `site-packages`).
 
-**可选: 装 `uv`**(`curl -LsSf https://astral.sh/uv/install.sh | sh`)。当某个角色
-同时拥有 `skill` 和 `run_command` 工具时,系统会在它的 prompt 里注入一段 PEP 723 +
-`uv run` 约定;agent 写出来的 Python 脚本可以自动拉第三方依赖,不污染宿主环境。
-没装 `uv` 也能跑,但社区里依赖第三方 Python 库的 skill 就跑不动了 —— 启动时会 WARN。
+**Optional: Install `uv`** (`curl -LsSf https://astral.sh/uv/install.sh | sh`). When a role has both `skill` and `run_command` tools, the system injects PEP 723 + `uv run` conventions into its prompt. Agent-written Python scripts can automatically fetch third-party dependencies without polluting the host environment. The bot runs without `uv`, but community skills requiring third-party Python libraries won't work — a WARNING is logged at startup.
 
-## 配置
+## Configuration
 
-首次启动会在 `~/.chat_team/` 下生成默认配置:
+On first launch, default configuration is generated under `~/.chat_team/`:
 
 ```
 ~/.chat_team/
-  config.yaml      # 全局参数 + 凭证 (chmod 0600);首次启动自动生成
-  team.md          # 全局团队画像;非空时每轮注入到所有员工的 system prompt;改后需重启
-  roles/           # 用户自定义角色 YAML,同名优先于内置
-  workspaces/      # 每个会话一个子目录
-  logs/            # chat_team.log,RotatingFileHandler
-  state/           # 跨会话状态保留位
+  config.yaml      # Global parameters + credentials (chmod 0600); auto-generated on first run
+  team.md          # Global team profile; injected into every employee's system prompt each turn if non-empty; requires restart after editing
+  roles/           # User-defined role YAMLs; same-name overrides built-ins
+  workspaces/      # One subdirectory per session
+  logs/            # chat_team.log, RotatingFileHandler
+  state/           # Cross-session state reservation
 ```
 
-把企微机器人后台拿到的 BotID / Secret 和 OpenAI 密钥填进 `~/.chat_team/config.yaml`:
+Fill in your WeCom BotID/Secret and OpenAI API key in `~/.chat_team/config.yaml`:
 
 ```yaml
 bots:
@@ -72,14 +59,14 @@ bots:
 
 llm:
   api_key: "sk-..."
-  base_url: "https://api.openai.com/v1"   # 替换成内部代理 / vLLM / Ollama 网关也行
+  base_url: "https://api.openai.com/v1"   # Can be replaced with internal proxy / vLLM / Ollama gateway
 ```
 
-凭证也可通过同名环境变量设置（`WECOM_BOT_ID` / `WECOM_SECRET` / `OPENAI_API_KEY` / `OPENAI_BASE_URL`），config.yaml 中的值优先。
+Credentials can also be set via environment variables (`WECOM_BOT_ID` / `WECOM_SECRET` / `OPENAI_API_KEY` / `OPENAI_BASE_URL`); values in `config.yaml` take precedence.
 
-测试时可用 `CHAT_TEAM_HOME=/tmp/chat_team_dev` 把整个根目录搬走,避免污染真实环境。
+For testing, use `CHAT_TEAM_HOME=/tmp/chat_team_dev` to relocate the entire root directory and avoid polluting the real environment.
 
-`config.yaml` 中模型相关配置已拆分为两组:
+Model-related configuration in `config.yaml` is split into two groups:
 
 ```yaml
 llm:
@@ -87,79 +74,69 @@ llm:
     model: gpt-4o-mini
     temperature: 0.3
     history_token_budget: 12000
-    reasoning_effort: ""   # low | medium | high,留空=模型默认
+    reasoning_effort: ""   # low | medium | high, empty = model default
   vision:
-    model: ""              # 空=复用 chat.model
+    model: ""              # Empty = reuse chat.model
     strategy: tool         # tool | direct
     image_detail: high
-    reasoning_effort: ""   # low | medium | high,留空=模型默认
+    reasoning_effort: ""   # low | medium | high, empty = model default
 ```
 
-### Solo 模式配置
+### Solo Mode Configuration
 
-不需要 `team_admin` 做前台路由、希望每个机器人专注一个角色?在 `config.yaml` 里切换:
+Don't need `team_admin` as a front-desk router? Want each bot to focus on a single role? Switch in `config.yaml`:
 
 ```yaml
 mode: solo
 bots:
-  - name: research_engineer    # 对应 roles/ 下的角色名
-    bot_id: "YOUR_BOT_ID_1"   # 企微后台拿到的 BotID
+  - name: research_engineer    # Must match a role name under roles/
+    bot_id: "YOUR_BOT_ID_1"   # BotID from WeCom admin console
     secret: "YOUR_SECRET_1"
   - name: customer_service
     bot_id: "YOUR_BOT_ID_2"
     secret: "YOUR_SECRET_2"
 ```
 
-启动命令不变(`python main.py`)。Solo 模式下:
-- 每个 bot 只会用自己绑定的角色回答,不会触发 `transfer_to_employee`
-- 多个 bot 在同一群里时,通过 `notebook_write` / `notebook_read` 共享事实
-- 各 bot 的对话历史互不影响(分别存储在 `session-{角色名}.json`)
+Startup command remains unchanged (`python main.py`). In Solo mode:
+- Each bot only responds using its bound role; `transfer_to_employee` is never triggered.
+- Multiple bots in the same group share facts via `notebook_write` / `notebook_read`.
+- Conversation histories are isolated per bot (stored separately as `session-{role}.json`).
 
-### 大模型调用调试日志
+### LLM Debug Logging
 
-排查"工具路由错了 / compactor 摘要变样 / 视觉 OCR 返回奇怪结果"这类问题时,光看
-`chat_team.log` 那点信息往往不够。把 `~/.chat_team/config.yaml` 里的
-`llm.debug_log_enabled` 设成 `true`,每次调 OpenAI 都会把**完整的 request + response**
-落成 JSON 文件:
+When troubleshooting issues like "wrong tool routing / compactor summary drift / weird vision OCR results", the limited info in `chat_team.log` may not suffice. Set `llm.debug_log_enabled` to `true` in `~/.chat_team/config.yaml` to log **complete request + response** as JSON files for every OpenAI call:
 
 ```
-~/.chat_team/workspaces/<sid>/.chat_team/llm/<时间戳>-<序号>-<角色>-<kind>.json
+~/.chat_team/workspaces/<sid>/.chat_team/llm/<timestamp>-<seq>-<role>-<kind>.json
 ```
 
-`kind` 三种:`agent`(角色主轮)/ `compactor`(压缩调用)/ `vision`(图片 OCR shim 和
-`describe_image` 工具)。每条记录包含 `messages` / `tools` / `model` / `temperature` /
-`reasoning_effort` / `response` / `finish_reason` / `usage`(token 用量)/ `latency_ms`,失败时多一项
-`error=repr(exc)`、`response=null`。
+Three `kind` values: `agent` (main role turn) / `compactor` (compression call) / `vision` (image OCR shim and `describe_image` tool). Each record includes `messages` / `tools` / `model` / `temperature` / `reasoning_effort` / `response` / `finish_reason` / `usage` (token counts) / `latency_ms`. On failure, an additional `error=repr(exc)` field is added with `response=null`.
 
-- **图片 base64 自动脱敏**为 `[redacted: <mime> <字节数> bytes]`,日志可以放心 grep。
-- **默认关闭**——一轮多次调用 + 压缩 + OCR 会快速堆出大量文件,生产**不要打开**,
-  并且 messages 里有用户对话原文,有隐私顾虑。
-- 写入失败只会在 `chat_team.log` 出一条 WARNING,不会影响主流程。
+- **Image base64 data is automatically redacted** to `[redacted: <mime> <bytes> bytes]`; logs are safe to grep.
+- **Disabled by default** — multiple calls per turn + compaction + OCR accumulate files quickly. **Do not enable in production**; messages contain raw user conversations with privacy concerns.
+- Write failures only produce a WARNING in `chat_team.log` and do not affect the main flow.
 
-排查完调回 `false` 重启即可。
+Set back to `false` and restart after debugging.
 
-### 团队画像 (`team.md`)
+### Team Profile (`team.md`)
 
-`~/.chat_team/team.md` 是自由 markdown 文本,非空时启动会原样读入,在每个虚拟员工
-**每一轮**的 system prompt 里以 `[团队信息]` 块注入 —— 让所有角色都知道自己服务于
-哪个公司/团队,而不必在每个角色 YAML 里复制相同的话术。
+`~/.chat_team/team.md` is free-form markdown text. If non-empty, it is read at startup and injected as a `[Team Info]` block into **every turn** of every virtual employee's system prompt — ensuring all roles know which company/team they serve without duplicating boilerplate in each role YAML.
 
-- 修改后**需要重启** `chat-team` 才能生效(配置启动时一次性加载)。
-- 不需要这个能力时把整个文件清空即可,行为完全等价于"未配置"。
-- 建议正文不超过 300 字,过长会推高每轮 API token 消耗。
+- Edits **require restarting** `chat-team` to take effect (configuration is loaded once at startup).
+- To disable, simply empty the file; behavior is identical to "not configured".
+- Keep content under 300 words to avoid inflating per-turn API token consumption.
 
-## 运行
+## Running
 
 ```bash
 python main.py
-# 等价于:
+# Equivalent to:
 chat-team
 ```
 
-`pip install -e .` 之后会注册 `chat-team` 命令(由 `pyproject.toml` 的
-`[project.scripts]` 提供),分发时一条命令即可。
+After `pip install -e .`, the `chat-team` command is registered (via `[project.scripts]` in `pyproject.toml`) for single-command distribution.
 
-正常启动应看到:
+Normal startup should show:
 
 ```
 INFO chat_team.app | chat_team starting; home=/Users/<you>/.chat_team
@@ -167,52 +144,46 @@ INFO chat_team.adapters.wecom | connecting to wss://openws.work.weixin.qq.com
 INFO chat_team.adapters.wecom | subscribe ok: {...errcode: 0...}
 ```
 
-之后就可以在企微里 @ 机器人或单聊。日志同时打到 stderr 和 `~/.chat_team/logs/chat_team.log`
-(按 10MB × 5 份轮转)。
+You can then @mention the bot or start a private chat in WeCom. Logs are written to both stderr and `~/.chat_team/logs/chat_team.log` (rotating 10MB × 5 files).
 
-## `chat-team-boss`(配置助手)
+## `chat-team-boss` (Configuration Assistant)
 
-不愿手写 YAML?`pip install -e .` 之后跑:
+Prefer not to hand-write YAML? After `pip install -e .`, run:
 
 ```bash
 chat-team-boss
 ```
 
-会进入一个**命令行对话**:你用中文说想要什么样的虚拟员工/团队画像,boss 替你读写
-`~/.chat_team/team.md` 和 `~/.chat_team/roles/*.yaml`。它会先把待写入的完整 YAML/markdown
-贴给你看、明确询问"是否确认写入",得到肯定回复后再落盘。
+This launches a **CLI conversational interface**: describe the virtual employees/team profile you want in natural language, and the boss agent reads/writes `~/.chat_team/team.md` and `~/.chat_team/roles/*.yaml` for you. It will paste the full proposed YAML/markdown for your review and explicitly ask "Confirm write?" before persisting to disk.
 
-- **会话不持久化**:每次启动从零开始;真正的"记忆"是落到磁盘上的那些文件。
-- **不上企微**:boss 角色仅在 CLI,**不会**出现在 `transfer_to_employee` 的员工枚举里,
-  也不会被 enter_chat 触发。
-- **改完即可**:`Ctrl+D` 或 `/quit` 退出,然后用 `chat-team` 启动主机器人即可生效
-  (角色注册表在主进程启动时一次性加载)。
+- **Sessions are not persisted**: Each invocation starts fresh; true "memory" lives in the files written to disk.
+- **Not connected to WeCom**: The boss role exists only in CLI; it **does not** appear in the `transfer_to_employee` enum and is never triggered by enter_chat.
+- **Done when ready**: Exit with `Ctrl+D` or `/quit`, then start the main bot with `chat-team` for changes to take effect (role registry is loaded once at main process startup).
 
-需要 `OPENAI_API_KEY`（同主机器人,从 `~/.chat_team/config.yaml` 的 `llm.api_key` 或环境变量读取）。
+Requires `OPENAI_API_KEY` (same as main bot; read from `llm.api_key` in `~/.chat_team/config.yaml` or environment variable).
 
-## 看可用工具清单
+## List Available Tools
 
-手写 role YAML 时,`tools:` 字段只能填主进程注册过的工具名。要看一份当前真实可用的清单:
+When hand-writing role YAMLs, the `tools:` field must reference tool names registered in the main process. To see the current list of available tools:
 
 ```bash
 chat-team-tools
-# 或不安装 console script: python -m chat_team.list_tools
+# Or without installing console script: python -m chat_team.list_tools
 ```
 
-会按工具名排序、附第一行简介。这个清单和 `chat-team-boss` 里的 `list_available_tools`
-工具同源 —— 加新工具后两边都自动可见,无需手动维护。
+Outputs tools sorted by name with a one-line description. This list shares the same source as `list_available_tools` in `chat-team-boss` — new tools become visible in both automatically without manual maintenance.
 
-## 加一个角色
+## Adding a Role
 
-不想手写?用 `chat-team-boss`(见上一节)让它替你写。手写示例:
+Don't want to hand-write? Use `chat-team-boss` (see previous section) to generate it. Manual example:
 
 ```yaml
 # ~/.chat_team/roles/data_analyst.yaml
 name: data_analyst
-display_name: 数据分析师
-description: 处理 SQL、报表、数据探索类需求。
+display_name: Data Analyst
+description: Handles SQL, reporting, and data exploration requests.
 system_prompt: |
-  你是数据分析师,名字叫"小数"。回答前先用 read_file 看一下当前目录的样本。
+  You are a data analyst named "Xiao Shu". Before answering, use read_file to check sample data in the current directory.
 tools:
   - read_file
   - list_dir
@@ -220,49 +191,46 @@ tools:
   - notebook_read
   - notebook_write
   - transfer_to_employee
-welcome_message: 你好,我是数据分析师小数,有数据相关的问题随时问我。
+welcome_message: Hello, I'm Xiao Shu, your data analyst. Feel free to ask any data-related questions.
 llm:
   model: gpt-4o-mini
   temperature: 0.2
   history_token_budget: 16000
 ```
 
-不需要重启 —— 不,要重启,角色注册表是进程启动时加载的。但**不需要改任何代码**,
-也不需要重新 `pip install`。`transfer_to_employee` 的目标 enum 会在下次启动时自动包含 `data_analyst`。
+No restart needed — actually, yes, restart is required since the role registry loads at process startup. But **no code changes** are needed, and no re-installation via `pip install` is necessary. The `transfer_to_employee` target enum will automatically include `data_analyst` on next startup.
 
-## 加一个工具
+## Adding a Tool
 
-`src/chat_team/agent/tools/` 下子类化 `Tool`,实现 `async run(ctx, **kwargs)`,
-然后在 `app.build_tool_registry` 里 `reg.register(...)`,最后在角色 YAML 的 `tools:`
-里引用名字即可。可恢复错误抛 `ToolError`(会作为 tool 消息回给 LLM)。
+Subclass `Tool` under `src/chat_team/agent/tools/`, implement `async run(ctx, **kwargs)`, register it in `app.build_tool_registry` via `reg.register(...)`, and reference the name in role YAML `tools:`. Raise `ToolError` for recoverable errors (returned to LLM as a tool message).
 
-## 烟囱测试 (不依赖 LLM / 网络)
+## Smoke Tests (No LLM / Network Dependency)
 
 ```bash
-python scripts/smoke_dispatch.py                  # 派发器 + Agent + 工具
-python scripts/smoke_transfer.py                  # 多跳交接 + 上限 + 未知目标
-python scripts/smoke_tools.py                     # 文件 / shell + 沙箱
-python scripts/smoke_wecom_parse.py               # adapter 解析 + LRU + stream 帧形
-python scripts/smoke_compaction_persistence.py    # tiktoken 压缩 + session.json 往返
+python scripts/smoke_dispatch.py                  # Dispatcher + Agent + Tools
+python scripts/smoke_transfer.py                  # Multi-hop transfer + cap + unknown target
+python scripts/smoke_tools.py                     # File / Shell + Sandbox
+python scripts/smoke_wecom_parse.py               # Adapter parsing + LRU + Stream frame shape
+python scripts/smoke_compaction_persistence.py    # Tiktoken compaction + session.json round-trip
 python scripts/smoke_media_events.py              # AES-256-CBC + enter_chat / disconnected
-python scripts/smoke_llm_debug_log.py             # 调试日志: image base64 脱敏 + 文件落盘 + per-session seq
-python scripts/smoke_solo.py                      # solo 模式: 独立 dispatcher + 共享 notebook + 隔离持久化
+python scripts/smoke_llm_debug_log.py             # Debug log: image base64 redaction + file write + per-session seq
+python scripts/smoke_solo.py                      # Solo mode: independent dispatcher + shared notebook + isolated persistence
 ```
 
-每个 smoke 都把 `CHAT_TEAM_HOME` 指到 `/tmp/...` 并在启动时 `rmtree`,所以反复跑安全。
+Each smoke test points `CHAT_TEAM_HOME` to `/tmp/...` and runs `rmtree` at startup, making repeated runs safe.
 
-## 扩展能力：MCP 与 Skills
+## Extensibility: MCP & Skills
 
-### MCP（Model Context Protocol）
+### MCP (Model Context Protocol)
 
-无需写 Python 即可接入外部工具服务器。在 `config.yaml` 声明服务器，在角色 YAML 引用，启动时自动发现并注册工具。
+Integrate external tool servers without writing Python. Declare servers in `config.yaml`, reference them in role YAML, and tools are auto-discovered and registered at startup.
 
-**配置示例**（`~/.chat_team/config.yaml`）：
+**Configuration Example** (`~/.chat_team/config.yaml`):
 
 ```yaml
 mcp:
   servers:
-    filesystem:                          # 服务器名，角色 YAML 中引用
+    filesystem:                          # Server name referenced in role YAML
       command: npx                       # stdio transport
       args: ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
     github:
@@ -274,43 +242,43 @@ mcp:
       url: http://localhost:8080/sse     # SSE transport
 ```
 
-Transport 自动推断：有 `command` → stdio，有 `url` → SSE。服务器名须匹配 `[a-zA-Z0-9_-]+` 且不含 `__`。
+Transport is auto-detected: `command` → stdio, `url` → SSE. Server names must match `[a-zA-Z0-9_-]+` and cannot contain `__`.
 
-**角色引用**（角色 YAML）：
+**Role Reference** (Role YAML):
 
 ```yaml
 name: developer
 tools: [read_file, write_file, run_command, transfer_to_employee]
-mcp_servers: [filesystem, github]        # 该角色可使用这两个服务器的所有工具
+mcp_servers: [filesystem, github]        # This role can use all tools from these two servers
 ```
 
-MCP 工具注册名为 `mcp__<server>__<tool>`（如 `mcp__filesystem__read_file`），agent 调用时无需感知前缀，直接使用原始工具名即可。
+MCP tools are registered as `mcp__<server>__<tool>` (e.g., `mcp__filesystem__read_file`). Agents invoke them using the original tool name without needing to know the prefix.
 
-**限制**：当前仅支持 MCP Tools，不支持 Resources / Prompts；修改 MCP 配置需重启 bot；`chat-team-tools` CLI 不列出 MCP 工具（运行时动态发现）。
+**Limitations**: Currently only supports MCP Tools (not Resources / Prompts); MCP config changes require bot restart; `chat-team-tools` CLI does not list MCP tools (dynamically discovered at runtime).
 
-### Skills（无代码能力包）
+### Skills (Code-Free Capability Packs)
 
-通过 drop-in 目录为角色添加指令型能力，无需编写 Python 工具。
+Add instruction-based capabilities to roles via drop-in directories without writing Python tools.
 
-**目录结构**：`~/.chat_team/skills/<name>/SKILL.md` + 可选辅助文件。
+**Directory Structure**: `~/.chat_team/skills/<name>/SKILL.md` + optional auxiliary files.
 
-**SKILL.md 格式**：
+**SKILL.md Format**:
 
 ```markdown
 ---
-name: data_analysis          # 必须等于目录名
-description: SQL 查询与报表生成指南   # 单行描述，注入系统提示 TOC
+name: data_analysis          # Must equal directory name
+description: SQL query and report generation guide   # Single-line description injected into system prompt TOC
 ---
 
-# 数据分析师 Skill
+# Data Analyst Skill
 
-当用户请求数据分析时，请遵循以下步骤：
-1. 先用 `list_dir` 查看可用数据文件
-2. 使用 `run_command` 执行 pandas 脚本
+When users request data analysis, follow these steps:
+1. Use `list_dir` to check available data files
+2. Execute pandas scripts via `run_command`
 ...
 ```
 
-**角色启用**：在角色 YAML 中同时声明 `skills:` 和 `tools: [skill, skill_read_file]`：
+**Enable in Role**: Declare both `skills:` and `tools: [skill, skill_read_file]` in role YAML:
 
 ```yaml
 name: data_analyst
@@ -318,50 +286,47 @@ skills: [data_analysis]
 tools: [skill, skill_read_file, read_file, run_command, transfer_to_employee]
 ```
 
-Agent 会在系统提示中看到 `[可用 skills] - data_analysis: SQL 查询与报表生成指南`，通过 `skill(name="data_analysis")` 获取完整指令，通过 `skill_read_file(skill="data_analysis", path="template.sql")` 读取辅助文件。
+Agents see `[Available skills] - data_analysis: SQL query and report generation guide` in their system prompt. They fetch full instructions via `skill(name="data_analysis")` and read auxiliary files via `skill_read_file(skill="data_analysis", path="template.sql")`.
 
-**Python 依赖**：当角色同时拥有 `skill` 和 `run_command` 工具时，系统自动注入 PEP 723 + `uv run` 约定，agent 编写的 Python 脚本可声明内联依赖并由 `uv` 全局缓存解析，不污染宿主环境。未安装 `uv` 时非 Python skill 仍可正常使用。
+**Python Dependencies**: When a role has both `skill` and `run_command` tools, the system automatically injects PEP 723 + `uv run` conventions. Agent-written Python scripts can declare inline dependencies resolved by `uv`'s global cache without polluting the host environment. Non-Python skills work normally even without `uv` installed.
 
-**注意**：Skill 不支持热加载，新增或修改后需重启 bot。
+**Note**: Skills do not support hot reloading; restart the bot after adding or modifying skills.
 
-## 常见问题
+## FAQ
 
-- **修改了 `team.md` / 角色 YAML / Skills / MCP 配置为何没生效？**
-  所有配置均在启动时一次性加载，修改后需重启 `chat-team` 才能生效。
+- **Why aren't my changes to `team.md` / Role YAML / Skills / MCP config taking effect?**
+  All configurations are loaded once at startup. Restart `chat-team` after modifications.
 
-- **Solo 模式下 bot 之间如何感知对方更新了 notebook？**
-  当前无主动通知机制。Bot A 写入 notebook 后，Bot B 需在下轮对话中主动调用 `notebook_read` 才能获取最新值。如需强同步，建议在 prompt 中约定关键事实更新后显式提醒对方查阅。
+- **How do bots perceive notebook updates from each other in Solo mode?**
+  There is no active notification mechanism currently. After Bot A writes to the notebook, Bot B must explicitly call `notebook_read` in its next turn to fetch the latest values. For strong synchronization, consider agreeing in prompts to explicitly remind others to check after updating critical facts.
 
-- **MCP 工具调用失败如何排查？**
-  检查 `~/.chat_team/logs/chat_team.log` 中的 WARNING 日志，确认服务器连接状态；若为 stdio transport，检查 `command` 是否可在终端手动执行；若为 SSE，确认 URL 可达且返回合法事件流。
+- **How to troubleshoot MCP tool call failures?**
+  Check WARNING logs in `~/.chat_team/logs/chat_team.log` to confirm server connection status. For stdio transport, verify the `command` can be executed manually in terminal. For SSE, ensure the URL is reachable and returns a valid event stream.
 
-- **图片 OCR 结果不准确怎么办？**
-  默认 eager prompt 优先提取文字。可在 `config.yaml` 中调整 `llm.vision.default_eager_prompt` 自定义 OCR 指令；或对特定图片让 agent 调用 `describe_image` 工具传入定制 prompt 重新识别。
+- **What if image OCR results are inaccurate?**
+  The default eager prompt prioritizes text extraction. Customize OCR instructions via `llm.vision.default_eager_prompt` in `config.yaml`; or have the agent call the `describe_image` tool with a custom prompt for specific images.
 
-- **Vision `direct` 模式 token 消耗过高？**
-  `direct` 模式将原始图片 base64 注入上下文，单张 1024² 图片约消耗 1600 tokens。建议仅在需要高保真视觉分析（如图表、艺术作品）的角色上启用，并相应调大 `llm.history_token_budget`。
+- **Vision `direct` mode consumes too many tokens?**
+  `direct` mode injects raw image base64 into context; a single 1024² image costs ~1600 tokens. Enable only for roles requiring high-fidelity visual analysis (e.g., charts, artwork), and increase `llm.history_token_budget` accordingly.
 
-- **`chat-team-tools` 看不到 MCP 工具？**
-  这是预期行为。MCP 工具在运行时动态发现，CLI 仅列出静态注册的内置工具。实际可用工具以 agent 运行时为准。
+- **Why doesn't `chat-team-tools` show MCP tools?**
+  This is expected behavior. MCP tools are dynamically discovered at runtime; the CLI only lists statically registered built-in tools. Actual available tools depend on agent runtime.
 
-## 设计要点
+## Design Notes
 
-详细架构、不显眼的细节、不要踩的地雷见 [`CLAUDE.md`](./CLAUDE.md)。给 Claude Code 看的,
-也给人看 —— 它把"为什么这样写"明明白白讲了一遍。
+For detailed architecture, subtle mechanics, and pitfalls to avoid, see [`CLAUDE.md`](./CLAUDE.md). Written for Claude Code, but also for humans — it clearly explains "why things are done this way".
 
-## 已知限制 (v1)
+## Known Limitations (v1)
 
-- **每个 BotID 单实例**。企微"新连接踢旧",同一 BotID 不能多副本启动,会互踢。
-  Solo 模式下一个进程可管多个不同 BotID,但每个 BotID 仍只能有一条连接。
-- **只支持 OpenAI Chat Completion**。Anthropic / Gemini 通过 `LLMProvider` 子类后续扩展。
-- **媒体回传仅支持图片 / 文件**(`send_image` / `send_file` 工具,走
-  `aibot_upload_media_init/chunk/finish`);voice / video 暂不支持。
-- **不支持配置热加载**。修改 `team.md`、角色 YAML、Skills、MCP 配置后均需重启 bot 才能生效。
-- **`chat-team-tools` CLI 不列出 MCP 工具**。MCP 工具为运行时动态发现，CLI 仅展示静态注册的内置工具。
-- **Vision `direct` 模式 token 消耗显著高于 `tool` 模式**。原始图片 base64 注入上下文，单张 1024² 图片约 1600 tokens；默认 `tool` 模式因前置 OCR 转为纯文本，token 开销降低约 6 倍。启用 `direct` 时需相应调大 `history_token_budget`。
-- **Solo 模式无跨 bot 主动通知**。notebook 更新后其他 bot 不会自动感知，需依赖 prompt 约定或手动 `notebook_read`。
-- **MCP 仅支持 Tools**。Resources 和 Prompts 暂未实现；单个服务器连接失败仅记 WARNING 并跳过，不阻塞启动，但该角色对应 MCP 工具将不可用。
+- **Single instance per BotID**. WeCom enforces "new connection kicks old"; the same BotID cannot run multiple replicas simultaneously (they will kick each other). Solo mode allows managing multiple different BotIDs in one process, but each BotID still supports only one connection.
+- **OpenAI Chat Completion only**. Anthropic / Gemini support planned via `LLMProvider` subclass extension.
+- **Media upload supports images / files only** (`send_image` / `send_file` tools via `aibot_upload_media_init/chunk/finish`); voice / video not yet supported.
+- **No hot-reload for configuration**. Changes to `team.md`, Role YAML, Skills, or MCP config require bot restart.
+- **`chat-team-tools` CLI does not list MCP tools**. MCP tools are dynamically discovered at runtime; CLI only shows statically registered built-in tools.
+- **Vision `direct` mode consumes significantly more tokens than `tool` mode**. Raw image base64 injection costs ~1600 tokens per 1024² image; default `tool` mode converts to text via upfront OCR, reducing token overhead by ~6×. Increase `history_token_budget` when enabling `direct`.
+- **No cross-bot active notifications in Solo mode**. Other bots won't automatically detect notebook updates; rely on prompt agreements or manual `notebook_read`.
+- **MCP supports Tools only**. Resources and Prompts are not yet implemented; individual server connection failures log a WARNING and skip without blocking startup, but corresponding MCP tools for that role will be unavailable.
 
-## 协议
+## Protocols
 
-- 协议规约: `docs/wechat_bot_api.md`, `docs/wechat_bot_接收消息.md`
+- Protocol Specifications: `docs/wechat_bot_api.md`, `docs/wechat_bot_接收消息.md`
