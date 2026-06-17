@@ -10,8 +10,14 @@ A WeCom (企业微信) AI Bot that fronts a team of role-differentiated "virtual
 
 ```bash
 # Run the bot (long-connection WeCom WebSocket).
+# Default runs as a background daemon (double-fork, survives SSH disconnect):
+#   stdout/stderr → ~/.chat_team/logs/chat_team.out   (prints + uncaught tracebacks)
+#   PID           → ~/.chat_team/chat_team.pid        (removed on clean exit)
 # First run seeds ~/.chat_team/{config.yaml,roles,workspaces,logs,state}.
-python main.py
+python main.py                # background daemon (default)
+python main.py -f             # foreground — use this under systemd/supervisor or for debugging
+python main.py --stop         # stop the background daemon (SIGTERM, then SIGKILL after 10s)
+# Same -f / --stop flags work on the `chat-team` console script.
 
 # Smoke tests — all are pure Python, no LLM/network. Run individually.
 python scripts/smoke_dispatch.py                  # dispatcher + agent + tools (scripted LLM)
@@ -61,7 +67,8 @@ All persistent state lives under `~/.chat_team/` (override with `CHAT_TEAM_HOME`
       notebook.index.json  # updated_at sidecar
       runs/<ts>.log        # full shell stdout (tool returns truncated)
       llm/<ts>-<seq>-<role>-<kind>.json  # per-LLM-call debug record (when llm.debug_log_enabled)
-  logs/                    # rotating chat_team.log
+  chat_team.pid            # PID of the background daemon (only in default background mode)
+  logs/                    # rotating chat_team.log + chat_team.out (daemon stdout/stderr)
   state/                   # cross-session bits (currently empty, reserved)
 ```
 

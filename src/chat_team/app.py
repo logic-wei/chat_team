@@ -1,11 +1,14 @@
 """Application bootstrap: wires settings + tools + roles + dispatcher + adapter."""
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import logging.handlers
 import os
 import shutil
+import signal
+import sys
 
 from .adapters.base import BotAdapter
 from .agent.tools.base import Tool, ToolRegistry
@@ -28,6 +31,7 @@ from .agent.tools.shell_tool import RunCommandTool
 from .agent.tools.skill_tools import SkillReadFileTool, SkillTool
 from .agent.tools.transfer_tool import TransferToEmployeeTool
 from .config import Settings, load_settings
+from .daemon import daemonize_and_run, stop_daemon
 from .dispatcher import Dispatcher
 from .llm.base import LLMProvider
 from .llm.image_cache import configure_default_cache
@@ -35,6 +39,7 @@ from .llm.openai_provider import OpenAIChatCompletionProvider
 from .roles.registry import RoleRegistry
 from .session.manager import SessionManager
 from .session.persistence import PersistenceManager
+from .paths import resolve_home
 from .skills.registry import SkillRegistry
 
 log = logging.getLogger(__name__)
@@ -195,6 +200,89 @@ def configure_logging(settings: Settings, *, file_only: bool = False) -> None:
     )
 
 
+# Grace period after a SIGTERM/SIGINT before we hard-exit the process.
+# In practice the WS adapter's ``_tear_down_connection`` and the MCP stdio
+# transport's anyio task group can both hang on a CancelledError, refusing to
+# unwind. Without this backstop, ``--stop`` (and systemd ``stop``) would block
+# until they escalate to SIGKILL after their own timeout. Five seconds is
+# generous for the persistence flush (debounced writes already in
+# session.json) and short enough to feel snappy.
+_HARD_EXIT_GRACE_SECONDS = 5.0
+
+
+def _force_exit_after_grace(task: "asyncio.Future", delay: float) -> None:
+    """Schedule a process exit if ``task`` hasn't finished within ``delay``.
+
+    Uses ``os._exit`` deliberately: it skips ``asyncio.run``'s own teardown
+    (``shutdown_asyncgens``, executor shutdown), which is exactly where the
+    MCP/anyio hang lives. Child MCP servers die on their own when this
+    process's stdio pipe closes; persistence is already on disk except for
+    at most the last debounce window (``persistence_debounce_seconds``).
+    """
+    import os
+
+    def _force() -> None:
+        if task.done():
+            return
+        log.warning(
+            "main task did not finish within %.1fs of shutdown signal; "
+            "forcing process exit (last persistence debounce may be lost)",
+            delay,
+        )
+        # Flush log handlers so the warning above actually lands on disk.
+        for h in logging.getLogger().handlers:
+            try:
+                h.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        os._exit(0)
+
+    asyncio.get_running_loop().call_later(delay, _force)
+
+
+async def _run_with_shutdown(main_awaitable) -> None:
+    """Run ``main_awaitable`` until it finishes or a shutdown signal arrives.
+
+    On SIGTERM/SIGINT the awaited task is cancelled, which lets the caller's
+    ``finally`` block (adapter.close, persistence flush, MCP teardown) execute
+    normally. This is what makes ``--stop`` and systemd's SIGTERM shut the bot
+    down gracefully instead of dropping in-flight session state.
+
+    As a backstop, if the cancelled task doesn't unwind within
+    ``_HARD_EXIT_GRACE_SECONDS`` (some adapter/MCP teardown paths can hang on
+    CancelledError), we force the process to exit. This keeps ``--stop`` and
+    systemd responsive at the cost of at most the last persistence debounce.
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(main_awaitable)
+
+    def _on_signal() -> None:
+        log.info("shutdown signal received, cancelling main task")
+        if not task.done():
+            task.cancel()
+        # Backstop: don't let a hung teardown block shutdown indefinitely.
+        _force_exit_after_grace(task, _HARD_EXIT_GRACE_SECONDS)
+
+    installed: list[int] = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_signal)
+            installed.append(sig)
+        except NotImplementedError:
+            pass  # non-Unix / non-main-thread
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        log.info("shutdown complete")
+    finally:
+        for sig in installed:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError):
+                pass
+
+
 async def _run_solo(
     settings: Settings,
     mcp_tools: list[Tool],
@@ -247,7 +335,9 @@ async def _run_solo(
         log.info("solo bot '%s' configured (bot_id=%s)", bot_cfg.name, bot_cfg.bot_id[:8] + "...")
 
     try:
-        await asyncio.gather(*[a.run_forever() for a, _ in adapters])
+        await _run_with_shutdown(
+            asyncio.gather(*[a.run_forever() for a, _ in adapters])
+        )
     finally:
         for a, _ in adapters:
             await a.close()
@@ -298,10 +388,13 @@ async def _async_main(adapter_factory) -> None:
         # one-shot connect+run for adapters that don't implement it.
         runner = getattr(adapter, "run_forever", None)
         if runner is not None:
-            await runner()
+            await _run_with_shutdown(runner())
         else:
-            await adapter.connect()
-            await adapter.run()
+            async def _one_shot() -> None:
+                await adapter.connect()
+                await adapter.run()
+
+            await _run_with_shutdown(_one_shot())
     finally:
         await adapter.close()
         if dispatcher.persistence is not None:
@@ -310,7 +403,42 @@ async def _async_main(adapter_factory) -> None:
 
 
 def run() -> None:
-    """Default entry point — uses WeCom adapter (stage 3 implements it)."""
-    from .adapters.wecom import WeComBotAdapter   # imported lazily for stage 2 testability
+    """Entry point for ``chat-team`` / ``python main.py``.
 
-    asyncio.run(_async_main(WeComBotAdapter))
+    By default the bot runs as a background daemon (survives SSH disconnect).
+    Use ``--foreground`` to run in the current terminal (for systemd/supervisor
+    or debugging), or ``--stop`` to terminate a running daemon.
+    """
+    parser = argparse.ArgumentParser(
+        prog="chat-team",
+        description="WeCom AI Bot — virtual employee team.",
+    )
+    parser.add_argument(
+        "-f", "--foreground",
+        action="store_true",
+        help="run in the foreground (default: background daemon)",
+    )
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="stop a running background daemon",
+    )
+    args = parser.parse_args()
+
+    from .adapters.wecom import WeComBotAdapter   # lazy import
+
+    home = resolve_home()
+    pid_path = home / "chat_team.pid"
+    out_path = home / "logs" / "chat_team.out"
+
+    if args.stop:
+        sys.exit(stop_daemon(pid_path))
+
+    if args.foreground:
+        asyncio.run(_async_main(WeComBotAdapter))
+        return
+
+    daemonize_and_run(
+        out_path, pid_path,
+        lambda: asyncio.run(_async_main(WeComBotAdapter)),
+    )
