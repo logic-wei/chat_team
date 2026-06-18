@@ -120,6 +120,58 @@ class McpConfig:
 
 
 @dataclass
+class PrivateChatConfig:
+    """Policy for whether the bot replies to single (private) chats.
+
+    Group chats always pass through; only single chats are gated.
+
+    Modes:
+      * ``open``      — reply to everyone
+      * ``closed``    — reply to no one
+      * ``blacklist`` — reply to everyone except ``blacklist``
+      * ``whitelist`` — reply only to ``whitelist`` (DEFAULT — see below)
+
+    Default mode is ``whitelist`` with an empty list, i.e. default-deny:
+    a brand-new install or an upgrade that doesn't add a ``private_chat``
+    block will NOT reply to any private chat until the maintainer explicitly
+    opts in (either by switching ``mode`` or by populating ``whitelist``).
+    Group chats are always served regardless.
+
+    IMPORTANT for upgrades: pre-feature deployments replied to every private
+    chat. After this change, the bot will go silent on private chats until
+    you add ``private_chat: {mode: open}`` (or a populated whitelist). The
+    ``team_admin`` role can still be reached via group chats and the
+    ``chat-team-boss`` CLI (which bypasses this gate entirely).
+
+    ``blocked_reply`` is sent (as a single text message) to a user whose
+    private chat was blocked. Empty string = silent drop. Note: this only
+    gates one-to-one single chats; group chats are unaffected.
+    """
+    mode: str = "whitelist"
+    whitelist: list[str] = field(default_factory=list)
+    blacklist: list[str] = field(default_factory=list)
+    # Default is NON-empty: a default-deny policy that silently drops would
+    # trap users in a dead-end (they can't learn their own userid to ask the
+    # maintainer to whitelist them). The {userid} placeholder is substituted
+    # by the adapter with the blocked sender's WeCom userid, so a brand-new
+    # install self-documents the onboarding path without any config.
+    blocked_reply: str = "私聊未开放。你的企业微信账号是 {userid},请联系管理员将其加入白名单。"
+
+    def allows(self, user_id: str) -> bool:
+        """True if this user_id should receive a reply in a single chat."""
+        if self.mode == "open":
+            return True
+        if self.mode == "closed":
+            return False
+        if self.mode == "blacklist":
+            return user_id not in self.blacklist
+        # "whitelist" or any unrecognised value → fail closed (default-deny).
+        # A typo in config.yaml can't accidentally expose the bot to everyone;
+        # the maintainer simply adds their own userid to whitelist once.
+        return user_id in self.whitelist
+
+
+@dataclass
 class BotConfig:
     """One WeCom bot entry. Solo mode requires ``name`` (= role); team mode doesn't."""
     bot_id: str
@@ -142,6 +194,7 @@ class Settings:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    private_chat: PrivateChatConfig = field(default_factory=PrivateChatConfig)
     team_profile: str = ""
 
 
@@ -206,6 +259,30 @@ def load_settings(paths: Paths | None = None) -> Settings:
         _coerce(settings.logging, raw["logging"])
     if isinstance(raw.get("cleanup"), dict):
         _coerce(settings.cleanup, raw["cleanup"])
+
+    if isinstance(raw.get("private_chat"), dict):
+        pc_raw = raw["private_chat"]
+        if not isinstance(pc_raw, dict):
+            _log.warning("private_chat must be a mapping; ignoring")
+        else:
+            valid_modes = {"open", "closed", "blacklist", "whitelist"}
+            # Default to whitelist (default-deny) when the block exists but
+            # omits ``mode`` — matches PrivateChatConfig's dataclass default.
+            mode = str(pc_raw.get("mode", "whitelist")).strip().lower()
+            if mode not in valid_modes:
+                _log.warning(
+                    "private_chat.mode=%r is not one of %s; defaulting to "
+                    "'whitelist' (default-deny) — populate private_chat.whitelist "
+                    "or set mode: open to enable private replies",
+                    pc_raw.get("mode"), sorted(valid_modes),
+                )
+                mode = "whitelist"
+            settings.private_chat = PrivateChatConfig(
+                mode=mode,
+                whitelist=[str(u).strip() for u in (pc_raw.get("whitelist") or []) if str(u).strip()],
+                blacklist=[str(u).strip() for u in (pc_raw.get("blacklist") or []) if str(u).strip()],
+                blocked_reply=str(pc_raw.get("blocked_reply", "") or ""),
+            )
 
     if isinstance(raw.get("mcp"), dict):
         servers_raw = raw["mcp"].get("servers")

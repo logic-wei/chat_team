@@ -439,6 +439,22 @@ class WeComBotAdapter(BotAdapter):
         if inbound is None:
             return                                           # unsupported msgtype, already logged
 
+        # Private-chat policy gate. Group chats always pass through;
+        # only single chats are filtered by ``private_chat`` in config.yaml.
+        # Done BEFORE the 思考中 frame so a blocked user doesn't see the
+        # "thinking..." spinner forever.
+        if inbound.chat_type == ChatType.SINGLE:
+            pc = self.settings.private_chat
+            if not pc.allows(inbound.user_id):
+                log.info(
+                    "private chat blocked: user=%s mode=%s",
+                    inbound.user_id, pc.mode,
+                )
+                await self._reply_blocked(
+                    inbound.reply_token, pc.blocked_reply, inbound.user_id,
+                )
+                return
+
         msgtype = body.get("msgtype") or "text"
         try:
             blocks = await self._resolve_inbound_blocks(
@@ -760,6 +776,19 @@ class WeComBotAdapter(BotAdapter):
         if msg_id and not self._msgid_lru.add(msg_id):
             return
         if event == "enter_chat":
+            # Apply the same private-chat policy gate to enter_chat welcomes
+            # so a blocked user doesn't see the welcome message even though
+            # their subsequent messages would be dropped.
+            chat_type_raw = body.get("chattype") or "single"
+            from_user = (body.get("from") or {}).get("userid") or ""
+            if chat_type_raw != "group":
+                pc = self.settings.private_chat
+                if from_user and not pc.allows(from_user):
+                    log.info(
+                        "enter_chat blocked (single): user=%s mode=%s",
+                        from_user, pc.mode,
+                    )
+                    return
             session_id = self._session_id_from_body(body)
             await self._reply_welcome(headers.get("req_id"), session_id)
         elif event == "disconnected_event":
@@ -819,3 +848,52 @@ class WeComBotAdapter(BotAdapter):
             "body": {"msgtype": "text", "text": {"content": welcome}},
         }
         await self._enqueue_write(payload)
+
+    async def _reply_blocked(
+        self,
+        req_id: str | None,
+        text: str,
+        user_id: str = "",
+    ) -> None:
+        """Send a single text reply to a blocked private chat.
+
+        ``text`` is treated as a template and supports one placeholder:
+
+          ``{userid}`` — replaced with the blocked sender's WeCom ``userid``
+                         (the same value used by ``private_chat.whitelist``
+                         / ``blacklist``).
+
+        The {userid} placeholder exists because end users have no way to
+        learn their own WeCom userid (it isn't surfaced in the client) yet
+        the maintainer needs that exact string to add them to whitelist.
+        A common pattern is:
+
+            blocked_reply: "私聊未开放。你的企业微信账号是 {userid},请联系管理员开通。"
+
+        — the user sends one message and immediately learns the string to
+        hand to the maintainer.
+
+        When ``text`` is empty the message is silently dropped — appropriate
+        for ``closed`` mode where you want no feedback.
+        """
+        if not text:
+            return
+        # str.format with an explicit mapping (not **locals) so a literal
+        # stray ``{`` in the text can't raise and so unknown placeholders
+        # survive verbatim rather than blowing up the reply path.
+        try:
+            content = text.format(userid=user_id)
+        except (KeyError, IndexError):
+            # Unknown placeholder like {foo} — render literally so a typo
+            # in config.yaml can't take the bot's reply path down.
+            content = text.replace("{userid}", user_id)
+        # IMPORTANT: replies to ``aibot_msg_callback`` MUST use the stream
+        # frame format (msgtype=stream, finish=true). A plain msgtype=text
+        # frame is silently dropped by WeCom for ordinary message callbacks
+        # (text frames only work for ``aibot_respond_welcome_msg`` welcome
+        # events). Reuse ``WeComStreamHandle`` — the same path the normal
+        # handler uses — to deliver a single finished stream frame; this is
+        # the only format WeCom honours here.
+        stream = WeComStreamHandle(self, req_id=req_id)
+        await stream.finish(content)
+        log.info("blocked_reply delivered: user=%s", user_id)

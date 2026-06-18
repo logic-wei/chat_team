@@ -27,6 +27,54 @@ workspace_root: workspaces           # one subdirectory per chat session
 default_role: team_admin             # role that handles a brand-new session
 log_level: INFO                      # DEBUG / INFO / WARNING / ERROR
 
+# 私聊策略 (single chat policy) — 控制机器人是否回复 1:1 私聊。
+# 群聊始终放行,不受此配置影响;仅过滤 chattype=single 的消息。
+#
+# ⚠ 默认是 default-deny:不加这一段 (或加一段但不写 mode),默认就是
+#   whitelist + 空名单,即**对所有私聊都不回复**。
+#   - 想恢复"老行为 = 回复所有私聊":显式写 mode: open
+#   - 想给指定同事开私聊:把他们的 userid 加进 whitelist
+#   - 升级注意:本版本之前机器人会回复所有私聊;升级后请把需要私聊
+#     的 userid 加进 whitelist,或显式 mode: open,否则机器人不再回私聊
+#     (群聊和 chat-team-boss CLI 不受影响)。
+#
+# 四种模式:
+#   whitelist  — 默认。只回复名单内的 userid,其余不回复
+#   open       — 回复所有私聊 (老版本的行为)
+#   closed     — 拒绝所有私聊
+#   blacklist  — 黑名单,名单内的 userid 不回复,其余正常回复
+#
+# 列表中的标识是企业微信 userid (即 IncomingMessage.user_id,
+# 来自消息体 body.from.userid)。同名环境变量无效,只在 config.yaml 配置。
+# ⚠ userid 不是成员姓名也不是手机号 — 企业微信终端用户看不到自己的 userid,
+#   必须靠以下三种方式之一获取后再填入名单:
+#
+#   方式 1 (推荐):让 blocked_reply 自动回复 userid。blocked_reply 支持
+#     一个占位符 {userid},被拦截时会把发送者自己的 userid 替换进去。
+#     配好后,让该同事私聊机器人发条消息,他就能收到"你的账号是 xxx",
+#     再把这个 xxx 报给你加进 whitelist。一次配置永久有效。
+#
+#   方式 2:看日志。被拦截消息会写一行 INFO 到
+#     ~/.chat_team/logs/chat_team.log:
+#       private chat blocked: user=<userid> mode=whitelist
+#     让同事发条私聊消息,翻日志即可。
+#
+#   方式 3:企业微信管理后台 → 通讯录 → 选成员 → 账号 (即 userid)。
+#     需要管理员后台权限。
+#
+# 写错的 mode (拼错、空字符串等) 会回落到 whitelist 并打印 WARNING。
+#
+# blocked_reply 留空 = 静默丢弃被拦截的消息;非空 = 把这段文字作为单条
+# 文本消息回复给被拦截用户。支持占位符 {userid} (见上方方式 1)。
+# 被拦截的私聊不会创建 session,不会触发 _handle_msg_callback 后续流程。
+#
+# 推荐示例:只回复两个指定同事,其他人收到自己的 userid 提示后丢弃
+# private_chat:
+#   mode: whitelist                   # 可省略,默认就是 whitelist
+#   whitelist: [zhang_san, li_si]     # 企业微信 userid 列表 (按上面三种方式获取)
+#   blacklist: []                     # 企业微信 userid 列表
+#   blocked_reply: "私聊未开放。你的企业微信账号是 {userid},请联系管理员开通。"
+
 session:
   msgid_lru_size: 500                # WeCom callback dedup window
   persistence_debounce_seconds: 10   # session.json flush debounce
