@@ -603,17 +603,34 @@ class WeComBotAdapter(BotAdapter):
 
         if msgtype == "mixed":
             items = (payload.get("mixed") or {}).get("msg_item") or []
-            # Sequential iteration (rather than asyncio.gather) keeps things
-            # simple; ordering is preserved by construction. WeCom rarely
-            # delivers more than a handful of items per mixed message.
-            blocks: list[ContentBlock] = []
-            for i, it in enumerate(items):
+            # Download all sub-trees CONCURRENTLY rather than serially.
+            #
+            # Why: WeCom image download URLs expire ~5 minutes after the
+            # callback is delivered. The old serial loop downloaded one
+            # image at a time; with N × ~1MB images (e.g. a 9-photo vehicle
+            # inspection burst) the cumulative wall time exceeded the URL
+            # lifetime, so the tail URLs 404'd and the user saw
+            # ``[图片下载失败]`` placeholders for items they did send.
+            # Concurrent download parallelises the wait so all URLs are
+            # fetched inside their validity window.
+            #
+            # Order is preserved: ``asyncio.gather`` returns results in
+            # input order, so the assembled block list matches the user's
+            # photo order.
+            async def _flatten_one(i: int, it: dict[str, Any]) -> list[ContentBlock]:
                 it_type = it.get("msgtype") or ""
                 sub = await self._flatten_payload(
                     it, it_type, session_id, msg_id, idx=i,
                 )
                 if not sub and it_type:
                     sub = [{"type": "text", "text": f"[未支持的 mixed 子项: {it_type}]"}]
+                return sub
+
+            sub_lists = await asyncio.gather(
+                *(_flatten_one(i, it) for i, it in enumerate(items))
+            )
+            blocks: list[ContentBlock] = []
+            for sub in sub_lists:
                 blocks.extend(sub)
             return blocks
 

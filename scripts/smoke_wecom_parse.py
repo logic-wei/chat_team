@@ -5,6 +5,7 @@ Run: ``python3 scripts/smoke_wecom_parse.py`` — does NOT touch the network.
 from __future__ import annotations
 
 import asyncio
+import time
 import json
 import os
 import shutil
@@ -188,7 +189,59 @@ async def test_stream_frame_shape():
     assert frames[1]["body"]["stream"]["content"] == "done"
 
 
+async def test_mixed_multi_image_downloaded_concurrently():
+    """mixed multi-image bursts must download CONCURRENTLY, not serially.
+
+    Regression guard for the [图片下载失败] bug: WeCom download URLs expire
+    ~5 minutes after delivery. The old serial loop downloaded one image at
+    a time; for N large images the cumulative wait exceeded the URL
+    lifetime and the tail images 404'd. We mock _save_media_bytes with a
+    fixed per-image delay and assert all downloads started within ~one
+    delay window (concurrent) rather than strung out across N windows
+    (serial).
+    """
+    settings = load_settings()
+    adapter = WeComBotAdapter(settings, bot_id="BOT", secret="s")
+
+    start_times: list[float] = []
+    per_image_delay = 0.3
+
+    async def fake_save(payload, msgtype, session_id, media_tag):
+        start_times.append(time.monotonic())
+        await asyncio.sleep(per_image_delay)
+        return f"./inbox/fake-{media_tag}.jpg"
+
+    adapter._save_media_bytes = fake_save
+
+    items = [
+        {"msgtype": "image", "image": {"url": "x", "aeskey": "y"}}
+        for _ in range(9)
+    ]
+    blocks = await adapter._flatten_payload(
+        {"mixed": {"msg_item": items}}, "mixed", "sess", "mid", idx=0,
+    )
+
+    # All 9 images resolved (no [图片下载失败] placeholders).
+    image_blocks = [b for b in blocks if b.get("type") == "image"]
+    assert len(image_blocks) == 9, f"expected 9 image blocks, got {len(image_blocks)}"
+
+    # Concurrency assertion: serial download of 9 × 0.3s = 2.7s minimum.
+    # Concurrent download fits all 9 inside one ~0.3s window. Allow headroom
+    # for scheduling jitter but stay well under the serial floor.
+    span = max(start_times) - min(start_times)
+    assert span < per_image_delay, (
+        f"mixed downloads not concurrent: first-to-last start span = {span:.2f}s "
+        f"(serial floor would be ~{per_image_delay * 9:.1f}s)"
+    )
+
+    # Order preserved: gather returns in input order, so the assembled block
+    # list must match the original photo order (here all identical, so just
+    # assert count and type again as a sanity check).
+    assert all(b.get("path", "").startswith("./inbox/fake-") for b in image_blocks)
+
+
 async def main():
+
     test_lru()
     test_mention_strip()
     test_strip_mention_first_text_block_only()
@@ -198,6 +251,7 @@ async def main():
     await test_parse_inbound_image_no_workspace()
     test_dedup()
     await test_stream_frame_shape()
+    await test_mixed_multi_image_downloaded_concurrently()
     print("ALL WeCom UNIT TESTS PASSED")
 
 
