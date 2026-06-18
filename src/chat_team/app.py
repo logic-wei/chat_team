@@ -59,7 +59,7 @@ def build_tool_registry(
     reg.register(ListDirTool())
     reg.register(GlobTool())
     reg.register(GrepTool())
-    reg.register(RunCommandTool())
+    reg.register(RunCommandTool(skills=skills, roles=roles))
     reg.register(NotebookReadTool())
     reg.register(NotebookWriteTool())
     reg.register(NotebookDeleteTool())

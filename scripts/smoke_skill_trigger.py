@@ -25,6 +25,7 @@ os.environ["CHAT_TEAM_HOME"] = "/tmp/chat_team_skill_trigger_smoke"
 shutil.rmtree(os.environ["CHAT_TEAM_HOME"], ignore_errors=True)
 
 from chat_team.agent.tools.base import ToolContext  # noqa: E402
+from chat_team.agent.tools.shell_tool import RunCommandTool  # noqa: E402
 from chat_team.agent.tools.skill_tools import SkillTool, ToolError  # noqa: E402
 from chat_team.roles.registry import RoleRegistry  # noqa: E402
 from chat_team.skills.registry import SkillRegistry  # noqa: E402
@@ -143,6 +144,65 @@ async def main():
     body = await _run_skill(session, "report-gen", history_vision)
     assert "the body" in body
     print("✓ vision-block user message scanned correctly")
+
+    # ---------------- run_command bypass prevention ----------------
+    # The LLM has been observed bypassing skill() by directly shelling out
+    # to skill scripts. The RunCommandTool must enforce the same gate.
+
+    # Build a RunCommandTool instance with the same skill registry.
+    shell_tool = RunCommandTool(skills=skills, roles=roles)
+
+    # --- 6. run_command referencing protected skill dir WITHOUT keyword → block ---
+    # Mock the actual exec so we only test the gate (no real subprocess).
+    async def _no_op_run(self, *a, **kw):
+        return "(mocked)"
+
+    shell_tool_run_orig = shell_tool.run
+    # Patch _execute so we never shell out; just the gate matters.
+    # We can't easily mock subprocess, so just call the gate helper directly
+    # AND confirm a real .run() with the bypass command raises before exec.
+    try:
+        # Use a known-good skills directory path. The SkillRegistry resolves
+        # to absolute paths under our test home.
+        report_skill = skills.get("report-gen")
+        bypass_cmd = f"cd {report_skill.directory} && python gen.py"
+        ctx_blocked = _ctx_with_history(
+            SimpleNamespace(current_role="tester", agents_by_role={}),
+            history_no_kw,  # most recent user msg = "@bot" (no keyword)
+        )
+        # We need a session that exposes the tool registry; simplest is to
+        # set ctx.settings so timeout parsing doesn't fail. Use a stub.
+        ctx_blocked.settings = SimpleNamespace(tools=SimpleNamespace(
+            shell_timeout_seconds=10, shell_env_extra_drop=[],
+            shell_output_max_bytes=1024))
+        await shell_tool.run(ctx_blocked, command=bypass_cmd)
+        assert False, "expected ToolError from run_command bypass"
+    except ToolError as exc:
+        msg = str(exc)
+        assert "受触发词保护" in msg, msg
+        assert "report-gen" in msg, msg
+        print("✓ run_command bypass blocked (no trigger keyword)")
+
+    # --- 7. same bypass command WITH trigger keyword → gate passes ---
+    # (We can't easily mock subprocess here; instead, verify the gate
+    # itself does NOT raise by calling the helper directly.)
+    from chat_team.agent.tools.skill_tools import scan_command_for_protected_skills
+    ctx_kw = _ctx_with_history(
+        SimpleNamespace(current_role="tester", agents_by_role={}),
+        history_kw,  # most recent user msg = "出报告"
+    )
+    # No raise = gate passed.
+    scan_command_for_protected_skills(bypass_cmd, skills, ctx_kw)
+    print("✓ run_command bypass allowed when trigger keyword present")
+
+    # --- 8. unrelated command (no skill reference) is never gated ---
+    ctx_clean = _ctx_with_history(
+        SimpleNamespace(current_role="tester", agents_by_role={}),
+        history_no_kw,
+    )
+    scan_command_for_protected_skills("ls -la /tmp", skills, ctx_clean)
+    scan_command_for_protected_skills("echo hello", skills, ctx_clean)
+    print("✓ unrelated commands not gated")
 
     print("ALL SKILL TRIGGER-GATE TESTS PASSED")
 
