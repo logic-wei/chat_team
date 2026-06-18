@@ -121,7 +121,9 @@ llm:
   request_timeout_seconds: 60        # per-attempt timeout ceiling for one LLM request
   max_retries: 3                     # total attempts including first call (transient errors only)
   retry_initial_delay: 1.0           # backoff base seconds before retry, with jitter
-  # max_tool_loops_per_turn: 16      # max LLM↔tool round-trips in a single turn
+  max_tool_loops_per_turn: 16        # 单轮内 LLM↔工具往返上限;
+                                     # 工具依赖很多/复杂任务可调高(如 32 或 64),
+                                     # 调小可以更早触发熔断保护代币预算
 
 logging:
   max_bytes: 10485760                # 10 MB per log file

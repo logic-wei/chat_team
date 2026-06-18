@@ -53,19 +53,28 @@ def decrypt(ciphertext: bytes, aeskey_b64: str) -> bytes:
 HttpGet = Callable[[str], Awaitable[bytes]]
 
 
+# Per-attempt timeout and total attempt count for a single media URL.
+# Rationale: WeCom download URLs expire ~5 minutes after delivery. With
+# 30s per attempt × 4 attempts = 120s worst-case, we still leave half the
+# URL lifetime as headroom even on a fully-failed sibling burst.
+_DOWNLOAD_TIMEOUT_SECONDS = 30
+_DOWNLOAD_MAX_ATTEMPTS = 4   # = 1 initial + 3 retries
+
+
 async def _http_get(url: str) -> bytes:
-    """Download one media URL with a tight per-attempt timeout + one retry.
+    """Download one media URL with a tight per-attempt timeout + retries.
 
     Why tight: WeCom download URLs expire ~5 minutes after delivery. Even
     under concurrent download, a single slow CDN node burning a 60s timeout
     eats the validity window for the rest. So:
       - per-attempt total timeout = 30s (down from 60s)
-      - one immediate retry on transient failure with a fresh session
-    Both attempts together stay well inside the URL lifetime.
+      - up to 3 immediate retries on transient failure, each with a fresh
+        session (4 attempts total)
+    All attempts together stay well inside the URL lifetime (120s of 300s).
     """
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(total=_DOWNLOAD_TIMEOUT_SECONDS)
     last_exc: Exception | None = None
-    for attempt in (1, 2):
+    for attempt in range(1, _DOWNLOAD_MAX_ATTEMPTS + 1):
         try:
             async with aiohttp.ClientSession(timeout=timeout) as sess:
                 async with sess.get(url) as resp:
@@ -74,10 +83,10 @@ async def _http_get(url: str) -> bytes:
         except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
             last_exc = exc
             log.warning(
-                "media download attempt %d failed for %s: %r",
-                attempt, url[:80], exc,
+                "media download attempt %d/%d failed for %s: %r",
+                attempt, _DOWNLOAD_MAX_ATTEMPTS, url[:80], exc,
             )
-            # fall through to retry (attempt 2) or re-raise after attempt 2
+            # fall through to next retry, or re-raise after the final attempt
     assert last_exc is not None
     raise last_exc
 
