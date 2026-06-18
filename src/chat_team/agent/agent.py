@@ -159,6 +159,15 @@ class Agent:
         pre_turn_len = len(self.history)
         self.history.append(ChatMessage(role="user", content=user_content))
 
+        # Per-turn circuit breaker: when the same (tool, args) raises
+        # ToolError 3+ times, the LLM is stuck in a retry loop (we've seen
+        # the Spark model try the identical run_command 14 times despite
+        # clear ToolError guidance). Force-break the loop with a fallback
+        # reply so the user gets a sensible answer and we don't burn the
+        # entire max_tool_loops_per_turn budget on one stubborn call.
+        repeated_error_counts: dict[tuple[str, str], int] = {}
+        REPEATED_ERROR_BREAK_THRESHOLD = 3
+
         try:
             for loop_idx in range(self.settings.llm.max_tool_loops_per_turn):
                 sys_msgs = self._build_system_messages()
@@ -204,6 +213,27 @@ class Agent:
                         raise                              # propagate to dispatcher
                     except ToolError as err:
                         result = f"[tool_error] {err}"
+                        # Circuit breaker: track repeated identical errors.
+                        args_sig = json.dumps(call.arguments or {}, sort_keys=True, ensure_ascii=False)
+                        key = (call.name, args_sig)
+                        repeated_error_counts[key] = repeated_error_counts.get(key, 0) + 1
+                        if repeated_error_counts[key] >= REPEATED_ERROR_BREAK_THRESHOLD:
+                            log.warning(
+                                "agent %s: tool %s raised ToolError %d times with identical args; "
+                                "breaking tool loop to avoid infinite retry",
+                                self.role.name, call.name,
+                                repeated_error_counts[key],
+                            )
+                            self.history.append(ChatMessage(
+                                role="tool",
+                                content=stringify_result(result),
+                                tool_call_id=call.id,
+                                name=call.name,
+                            ))
+                            return (
+                                "我尝试了多次执行该操作但均被系统策略拒绝,可能是因为缺少必要的关键词。"
+                                "如需生成报告,请回复『报告』或『出报告』等关键词,我会立即为您处理。"
+                            )
                     except Exception as err:               # noqa: BLE001
                         log.exception("tool %s raised", call.name)
                         result = f"[tool_error] {type(err).__name__}: {err}"
