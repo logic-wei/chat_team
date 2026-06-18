@@ -7,6 +7,7 @@ first 16 bytes of the (decoded) aeskey, per the protocol docs.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from typing import Awaitable, Callable
@@ -53,11 +54,32 @@ HttpGet = Callable[[str], Awaitable[bytes]]
 
 
 async def _http_get(url: str) -> bytes:
-    timeout = aiohttp.ClientTimeout(total=60)
-    async with aiohttp.ClientSession(timeout=timeout) as sess:
-        async with sess.get(url) as resp:
-            resp.raise_for_status()
-            return await resp.read()
+    """Download one media URL with a tight per-attempt timeout + one retry.
+
+    Why tight: WeCom download URLs expire ~5 minutes after delivery. Even
+    under concurrent download, a single slow CDN node burning a 60s timeout
+    eats the validity window for the rest. So:
+      - per-attempt total timeout = 30s (down from 60s)
+      - one immediate retry on transient failure with a fresh session
+    Both attempts together stay well inside the URL lifetime.
+    """
+    timeout = aiohttp.ClientTimeout(total=30)
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(url) as resp:
+                    resp.raise_for_status()
+                    return await resp.read()
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            last_exc = exc
+            log.warning(
+                "media download attempt %d failed for %s: %r",
+                attempt, url[:80], exc,
+            )
+            # fall through to retry (attempt 2) or re-raise after attempt 2
+    assert last_exc is not None
+    raise last_exc
 
 
 async def download_and_decrypt(

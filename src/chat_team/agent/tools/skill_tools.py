@@ -75,6 +75,33 @@ def _clean_skill_name(raw: str) -> str:
     return s
 
 
+def _last_user_text(ctx: ToolContext) -> str:
+    """Return the most recent user message text in the calling agent's history.
+
+    Used by the trigger-keyword gate. Falls back to "" if no agent / no
+    user message is found (in which case the gate trivially blocks — safe
+    default for a default-deny policy).
+    """
+    role_name = ctx.session.current_role
+    agent = ctx.session.agents_by_role.get(role_name)
+    if agent is None:
+        return ""
+    # agent.history is user/assistant/tool only (system rebuilt per turn).
+    # Walk from the end to find the latest user entry.
+    for msg in reversed(agent.history):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            # Vision blocks: render via blocks_to_text for keyword scan.
+            from ...adapters.base import blocks_to_text
+            return blocks_to_text(content)
+        if isinstance(content, str):
+            return content
+        return str(content)
+    return ""
+
+
 def _resolve_skill_name_or_raise(raw_name: Any, skills: SkillRegistry) -> str:
     """Resolve a user/model-provided name to a concrete registry key."""
     if not isinstance(raw_name, str) or not raw_name.strip():
@@ -141,6 +168,21 @@ class SkillTool(Tool):
                 f"白名单: {', '.join(allowed) if allowed else '(空)'}"
             )
         skill = self._skills.get(name)
+        # Hard trigger-keyword gate. When the skill's frontmatter declares
+        # trigger_keywords, the most recent user message MUST contain at
+        # least one of them (case-insensitive substring). This is the
+        # code-level backstop for skills that must be explicitly requested
+        # — prompt-only "禁止自作主张" instructions are unreliable.
+        if skill.trigger_keywords:
+            user_text = _last_user_text(ctx).lower()
+            if not any(kw.lower() in user_text for kw in skill.trigger_keywords):
+                keywords_disp = " / ".join(skill.trigger_keywords)
+                raise ToolError(
+                    f"skill {name!r} 是受触发词保护的能力:必须看到用户消息里出现下列任一关键词才允许调用 "
+                    f"—— {keywords_disp} ——当前用户消息里没有。"
+                    f"请直接回答用户(例如告知已提取到的信息),并提示『如需{keywords_disp.split(" / ")[0]},"
+                    f"请回复该关键词』,不要尝试调用此 skill。"
+                )
         body = skill.body
         aux = _list_aux_files(skill.directory)
         work_dir = ctx.cwd.resolve()
