@@ -88,17 +88,26 @@ def _last_user_text(ctx: ToolContext) -> str:
         return ""
     # agent.history is user/assistant/tool only (system rebuilt per turn).
     # Walk from the end to find the latest user entry.
+    #
+    # NOTE: in production, history holds ChatMessage dataclass instances
+    # (attribute access); in some smokes/tests it holds plain dicts. Be
+    # tolerant of both shapes so this helper is robust against future
+    # message-type changes.
+    def _get(msg, key, default=None):
+        if isinstance(msg, dict):
+            return msg.get(key, default)
+        return getattr(msg, key, default)
     for msg in reversed(agent.history):
-        if msg.get("role") != "user":
+        if _get(msg, "role") != "user":
             continue
-        content = msg.get("content")
+        content = _get(msg, "content")
         if isinstance(content, list):
             # Vision blocks: render via blocks_to_text for keyword scan.
             from ...adapters.base import blocks_to_text
             return blocks_to_text(content)
         if isinstance(content, str):
             return content
-        return str(content)
+        return str(content) if content is not None else ""
     return ""
 
 
