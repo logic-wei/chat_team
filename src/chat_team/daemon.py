@@ -211,3 +211,46 @@ def stop_daemon(pid_path: Path, timeout: float = 10.0) -> int:
     _clear_pid(pid_path)
     print(f"chat_team force-killed (pid={pid}).", file=sys.stderr)
     return 0
+
+
+def reload_daemon(pid_path: Path) -> int:
+    """SIGHUP the daemon named by ``pid_path`` to trigger a hot reload.
+
+    The running process's SIGHUP handler (installed in
+    ``app._run_with_shutdown``) re-reads config.yaml / team.md / roles / skills
+    and applies the changes in place — without dropping the WebSocket or
+    interrupting in-flight turns. Returns a process exit code.
+
+    Unlike ``stop_daemon``, this doesn't wait: SIGHUP is asynchronous by
+    nature (the reload touches disk + maybe an LLM call for compaction is in
+    flight), and the daemon logs the reload result to
+    ``~/.chat_team/logs/chat_team.log``.
+    """
+    if not hasattr(signal, "SIGHUP"):
+        print("SIGHUP not available on this platform; hot reload unsupported.",
+              file=sys.stderr)
+        return 1
+    if not pid_path.exists():
+        print(f"chat_team is not running (no pid file at {pid_path}).", file=sys.stderr)
+        return 1
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError) as e:
+        print(f"invalid pid file {pid_path}: {e}", file=sys.stderr)
+        _clear_pid(pid_path)
+        return 1
+    if not _process_alive(pid):
+        print(f"chat_team is not running (stale pid file, pid={pid}).", file=sys.stderr)
+        _clear_pid(pid_path)
+        return 1
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except ProcessLookupError:
+        _clear_pid(pid_path)
+        print(f"chat_team is not running (pid={pid} vanished).", file=sys.stderr)
+        return 1
+    print(
+        f"SIGHUP sent to chat_team (pid={pid}); hot reload triggered. "
+        f"Check ~/.chat_team/logs/chat_team.log for the result."
+    )
+    return 0

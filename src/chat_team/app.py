@@ -31,7 +31,7 @@ from .agent.tools.shell_tool import RunCommandTool
 from .agent.tools.skill_tools import SkillReadFileTool, SkillTool
 from .agent.tools.transfer_tool import TransferToEmployeeTool
 from .config import Settings, load_settings
-from .daemon import daemonize_and_run, stop_daemon
+from .daemon import daemonize_and_run, reload_daemon, stop_daemon
 from .dispatcher import Dispatcher
 from .llm.base import LLMProvider
 from .llm.image_cache import configure_default_cache
@@ -40,6 +40,7 @@ from .roles.registry import RoleRegistry
 from .session.manager import SessionManager
 from .session.persistence import PersistenceManager
 from .paths import resolve_home
+from .reload import Reloader
 from .skills.registry import SkillRegistry
 
 log = logging.getLogger(__name__)
@@ -181,23 +182,38 @@ def build_dispatcher(
 
 
 def configure_logging(settings: Settings, *, file_only: bool = False) -> None:
+    """(Re)configure root logging.
+
+    Idempotent: clears existing root handlers before re-adding so a hot
+    reload (SIGHUP → Reloader) doesn't accumulate duplicate handlers and
+    multi-log every line. Safe to call at startup and on every reload.
+    """
     settings.paths.logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = settings.paths.logs_dir / "chat_team.log"
     level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s")
     rotating = logging.handlers.RotatingFileHandler(
         log_file,
         maxBytes=settings.logging.max_bytes,
         backupCount=settings.logging.backup_count,
         encoding="utf-8",
     )
+    rotating.setFormatter(fmt)
     handlers: list[logging.Handler] = [rotating]
     if not file_only:
-        handlers.append(logging.StreamHandler())
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
-        handlers=handlers,
-    )
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        handlers.append(sh)
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        try:
+            h.close()
+        except Exception:  # noqa: BLE001
+            pass
+        root.removeHandler(h)
+    for h in handlers:
+        root.addHandler(h)
+    root.setLevel(level)
 
 
 # Grace period after a SIGTERM/SIGINT before we hard-exit the process.
@@ -240,7 +256,7 @@ def _force_exit_after_grace(task: "asyncio.Future", delay: float) -> None:
     asyncio.get_running_loop().call_later(delay, _force)
 
 
-async def _run_with_shutdown(main_awaitable) -> None:
+async def _run_with_shutdown(main_awaitable, *, on_sighup=None) -> None:
     """Run ``main_awaitable`` until it finishes or a shutdown signal arrives.
 
     On SIGTERM/SIGINT the awaited task is cancelled, which lets the caller's
@@ -252,6 +268,12 @@ async def _run_with_shutdown(main_awaitable) -> None:
     ``_HARD_EXIT_GRACE_SECONDS`` (some adapter/MCP teardown paths can hang on
     CancelledError), we force the process to exit. This keeps ``--stop`` and
     systemd responsive at the cost of at most the last persistence debounce.
+
+    ``on_sighup`` is an optional zero-arg callable (the ``Reloader.reload``
+    method) invoked when the process receives SIGHUP. Unlike SIGTERM/SIGINT,
+    SIGHUP does NOT cancel the main task — it triggers an in-place hot reload
+    of config/roles/skills/team.md without dropping the WebSocket connection.
+    This is what ``chat-team --reload`` and ``kill -HUP <pid>`` activate.
     """
     loop = asyncio.get_running_loop()
     task = asyncio.ensure_future(main_awaitable)
@@ -263,12 +285,32 @@ async def _run_with_shutdown(main_awaitable) -> None:
         # Backstop: don't let a hung teardown block shutdown indefinitely.
         _force_exit_after_grace(task, _HARD_EXIT_GRACE_SECONDS)
 
+    def _on_sighup() -> None:
+        if on_sighup is None:
+            log.info("SIGHUP received but no reloader wired; ignoring")
+            return
+        log.info("SIGHUP received, starting hot reload")
+        try:
+            report = on_sighup()
+            # report may be a CombinedReloadReport (has summary) or None.
+            msg = report.summary() if hasattr(report, "summary") else "done"
+            log.info("hot reload result: %s", msg)
+        except Exception:  # noqa: BLE001
+            log.exception("hot reload failed")
+
     installed: list[int] = []
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, _on_signal)
             installed.append(sig)
         except NotImplementedError:
+            pass  # non-Unix / non-main-thread
+    sighup_installed = False
+    if on_sighup is not None and hasattr(signal, "SIGHUP"):
+        try:
+            loop.add_signal_handler(signal.SIGHUP, _on_sighup)
+            sighup_installed = True
+        except (NotImplementedError, AttributeError):
             pass  # non-Unix / non-main-thread
 
     try:
@@ -279,6 +321,11 @@ async def _run_with_shutdown(main_awaitable) -> None:
         for sig in installed:
             try:
                 loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError):
+                pass
+        if sighup_installed:
+            try:
+                loop.remove_signal_handler(signal.SIGHUP)
             except (NotImplementedError, RuntimeError):
                 pass
 
@@ -334,9 +381,13 @@ async def _run_solo(
         adapters.append((adapter, dispatcher))
         log.info("solo bot '%s' configured (bot_id=%s)", bot_cfg.name, bot_cfg.bot_id[:8] + "...")
 
+    reloader = Reloader(
+        settings, [d for _, d in adapters], reconfigure_logging=configure_logging,
+    )
     try:
         await _run_with_shutdown(
-            asyncio.gather(*[a.run_forever() for a, _ in adapters])
+            asyncio.gather(*[a.run_forever() for a, _ in adapters]),
+            on_sighup=reloader.reload,
         )
     finally:
         for a, _ in adapters:
@@ -383,18 +434,21 @@ async def _async_main(adapter_factory) -> None:
         secret=bot.secret if bot else None,
     )
     adapter.set_handler(dispatcher.handle)
+    reloader = Reloader(
+        settings, [dispatcher], reconfigure_logging=configure_logging,
+    )
     try:
         # Prefer run_forever (handles transient WS loss); fall back to the
         # one-shot connect+run for adapters that don't implement it.
         runner = getattr(adapter, "run_forever", None)
         if runner is not None:
-            await _run_with_shutdown(runner())
+            await _run_with_shutdown(runner(), on_sighup=reloader.reload)
         else:
             async def _one_shot() -> None:
                 await adapter.connect()
                 await adapter.run()
 
-            await _run_with_shutdown(_one_shot())
+            await _run_with_shutdown(_one_shot(), on_sighup=reloader.reload)
     finally:
         await adapter.close()
         if dispatcher.persistence is not None:
@@ -423,6 +477,12 @@ def run() -> None:
         action="store_true",
         help="stop a running background daemon",
     )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="hot-reload config.yaml / team.md / roles / skills in a running "
+             "daemon (sends SIGHUP); the bot keeps serving without restart",
+    )
     args = parser.parse_args()
 
     from .adapters.wecom import WeComBotAdapter   # lazy import
@@ -433,6 +493,9 @@ def run() -> None:
 
     if args.stop:
         sys.exit(stop_daemon(pid_path))
+
+    if args.reload:
+        sys.exit(reload_daemon(pid_path))
 
     if args.foreground:
         asyncio.run(_async_main(WeComBotAdapter))

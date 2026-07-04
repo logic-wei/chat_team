@@ -62,6 +62,30 @@ class SkillRegistry:
     def all(self) -> list[Skill]:
         return [self._skills[n] for n in self.names()]
 
+    def reload_in_place(self, user_skills_dir: "Path | None" = None) -> tuple[list[str], list[str], list[str]]:
+        """Re-scan disk and atomically swap the internal skill dict.
+
+        Mirrors ``RoleRegistry.reload_in_place``: build a fresh dict off to
+        the side, then assign ``self._skills = new`` in one statement so every
+        holder of this registry instance (``Dispatcher.skills``,
+        ``SkillTool.skills``, ``SkillReadFileTool.skills``) sees the new
+        skills on its next call. Returns ``(added, removed, changed)``.
+        """
+        old = self._skills
+        fresh = type(self).load(user_skills_dir)
+        new = fresh._skills
+        old_names = set(old)
+        new_names = set(new)
+        added = sorted(new_names - old_names)
+        removed = sorted(old_names - new_names)
+        changed = sorted(
+            n for n in (old_names & new_names)
+            if old[n] != new[n]
+        )
+        self._skills = new
+        return added, removed, changed
+
+
     def render_toc(self, allowed: list[str]) -> str:
         """Render a ``- name: description-first-line`` list for the system prompt.
 

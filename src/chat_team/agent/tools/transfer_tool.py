@@ -34,6 +34,41 @@ class TransferToEmployeeTool(Tool):
             },
             "required": ["employee", "reason", "handoff_note"],
         }
+    def update_employees(self, available_employees: list[str]) -> bool:
+        """Refresh the ``employee`` enum after a role registry reload.
+
+        Rebuilds ``self.available`` and the ``parameters`` JSON-schema enum in
+        place so the next LLM call advertises the current set of colleagues
+        (e.g. a newly-added role YAML becomes transferable without a restart).
+
+        Returns True if the set actually changed.
+        """
+        new_avail = sorted(set(available_employees))
+        if new_avail == self.available:
+            return False
+        self.available = new_avail
+        # Rebuild the parameters dict so the enum reflects the new list. The
+        # rest of the schema (reason / handoff_note) is unchanged.
+        self.parameters = {
+            "type": "object",
+            "properties": {
+                "employee": {
+                    "type": "string",
+                    "enum": self.available,
+                    "description": "目标员工的 name(角色 yaml 中的 name 字段)",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "为什么交接(给用户/调用方看的简短说明)",
+                },
+                "handoff_note": {
+                    "type": "string",
+                    "description": "给接手同事的交接备忘:用户诉求/进展/注意事项,200 字以内。",
+                },
+            },
+            "required": ["employee", "reason", "handoff_note"],
+        }
+        return True
 
     async def run(self, ctx: ToolContext, **kwargs: Any) -> str:
         target = kwargs.get("employee")
