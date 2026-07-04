@@ -20,6 +20,12 @@ class Skill:
     description: str
     body: str
     directory: Path
+    # Optional trigger-keyword gate. When set, SkillTool.run refuses to
+    # load this skill unless the most recent user message contains at
+    # least one of these substrings (case-insensitive). Used for skills
+    # that MUST be explicitly requested (e.g. report generation), where
+    # a prompt-only "禁止自作主张" constraint is unreliable.
+    trigger_keywords: tuple[str, ...] = ()
 
     @classmethod
     def from_dir(cls, directory: Path) -> "Skill":
@@ -39,11 +45,20 @@ class Skill:
                 f"SKILL.md name mismatch in {skill_md}: "
                 f"frontmatter name={name!r} but directory={directory.name!r}; they must match"
             )
+        # Optional trigger_keywords: a list of substrings. Validated to be
+        # a list of non-empty strings; bad shape → ignored with no fail.
+        tk_raw = front.get("trigger_keywords") or []
+        trigger_keywords: tuple[str, ...] = ()
+        if isinstance(tk_raw, list):
+            trigger_keywords = tuple(
+                str(s).strip() for s in tk_raw if isinstance(s, str) and s.strip()
+            )
         return cls(
             name=name,
             description=description.strip(),
             body=body.strip(),
             directory=directory,
+            trigger_keywords=trigger_keywords,
         )
 
 

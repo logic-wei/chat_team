@@ -86,6 +86,7 @@ async def test_sniff_extension():
 async def test_adapter_image_flow():
     print("== test 3: image frame → inbox/<file>.jpg + image content_block ==")
     settings = load_settings()
+    settings.private_chat.mode = "open"
     workspace_root = settings.workspace_root
     workspace_root.mkdir(parents=True, exist_ok=True)
 
@@ -160,6 +161,7 @@ async def test_adapter_image_flow():
 async def test_adapter_mixed_flow():
     print("== test 4: mixed (text+image+text+image) preserves order in blocks ==")
     settings = load_settings()
+    settings.private_chat.mode = "open"
     aeskey1 = b64_aeskey()
     aeskey2 = b64_aeskey()
     fake_png = b"\x89PNG\r\n\x1a\n" + b"z" * 50
@@ -233,6 +235,7 @@ async def test_adapter_mixed_flow():
 async def test_event_flow():
     print("== test 5: enter_chat → welcome frame; disconnected → stop ==")
     settings = load_settings()
+    settings.private_chat.mode = "open"
     adapter = WeComBotAdapter(settings, bot_id="BOT", secret="S")
     adapter.set_handler(lambda *a, **k: asyncio.sleep(0))
 
@@ -281,6 +284,7 @@ async def test_welcome_matches_persisted_current_role():
     print("== test 5b: enter_chat welcome uses session's current_role, not default ==")
     import json as _json
     settings = load_settings()
+    settings.private_chat.mode = "open"
 
     # Seed a non-default role with its own welcome_message.
     role_path = settings.paths.user_roles_dir / "engineer.yaml"
@@ -355,6 +359,7 @@ async def test_welcome_matches_persisted_current_role():
 def _build_quote_adapter(settings, cipher_by_url):
     """Return (adapter, restore_fn). adapter has download stubbed so each
     URL in cipher_by_url decrypts to its mapped fake bytes."""
+    settings.private_chat.mode = "open"
     real_dl = wecom_media.download_and_decrypt
 
     async def patched_dl(url, key, *, max_bytes=wecom_media.DEFAULT_MAX_MEDIA_BYTES, fetch=None):
@@ -513,6 +518,119 @@ async def test_quote_mixed_multi_image_with_group_strip():
     assert "@bot" not in text
 
 
+async def test_inbound_prefetch_fifo_dispatch():
+    print("== test 7: media prefetch concurrent; dispatcher remains FIFO per session ==")
+    settings = load_settings()
+    adapter = WeComBotAdapter(settings, bot_id="BOT", secret="S")
+
+    sent: list[dict] = []
+    async def fake_enqueue(payload):
+        sent.append(payload)
+    adapter._enqueue_write = fake_enqueue            # noqa: SLF001
+
+    calls: list[str] = []
+    ready_order: list[str] = []
+
+    async def handler(inbound, stream):
+        calls.append(inbound.msg_id)
+
+    adapter.set_handler(handler)
+
+    original_resolve = adapter._resolve_inbound_blocks
+    delays = {"A": 0.20, "B": 0.05, "C": 0.0}
+
+    async def fake_resolve(body, msgtype, session_id, chat_type):
+        msgid = body["msgid"]
+        await asyncio.sleep(delays[msgid])
+        ready_order.append(msgid)
+        if msgid == "C":
+            return [{"type": "text", "text": "纯文本"}]
+        return [{"type": "image", "path": f"./inbox/{msgid}.jpg"}]
+
+    adapter._resolve_inbound_blocks = fake_resolve   # noqa: SLF001
+
+    def frame(msgid: str, msgtype: str) -> dict:
+        body = {
+            "msgid": msgid,
+            "aibotid": "BOT",
+            "chattype": "group",
+            "chatid": "G-FIFO",
+            "from": {"userid": "U"},
+            "msgtype": msgtype,
+        }
+        if msgtype == "text":
+            body["text"] = {"content": "纯文本"}
+        else:
+            body["image"] = {"url": msgid, "aeskey": "unused"}
+        return {"cmd": "aibot_msg_callback", "headers": {"req_id": f"rq-{msgid}"}, "body": body}
+
+    frames = [frame("A", "image"), frame("B", "image"), frame("C", "text")]
+    order_keys = [adapter._reserve_inbound_order(f) for f in frames]  # noqa: SLF001
+    await asyncio.gather(*(
+        adapter._handle_msg_callback(f, k)             # noqa: SLF001
+        for f, k in zip(frames, order_keys)
+    ))
+
+    adapter._resolve_inbound_blocks = original_resolve # noqa: SLF001
+
+    print("  ready order:", ready_order)
+    print("  handler order:", calls)
+    assert ready_order == ["C", "B", "A"], ready_order
+    assert calls == ["A", "B", "C"], calls
+    thinking_req_ids = [p["headers"]["req_id"] for p in sent if p["body"].get("stream", {}).get("content") == "思考中…"]
+    assert thinking_req_ids == ["rq-A", "rq-B", "rq-C"], thinking_req_ids
+
+
+async def test_blocked_private_reply_failure_does_not_block_fifo():
+    print("== test 8: blocked private reply failure still releases FIFO slot ==")
+    settings = load_settings()
+    settings.private_chat.mode = "closed"
+    adapter = WeComBotAdapter(settings, bot_id="BOT", secret="S")
+
+    async def broken_reply(req_id, template, user_id):
+        raise RuntimeError("simulated blocked_reply failure")
+
+    adapter._reply_blocked = broken_reply           # noqa: SLF001
+
+    calls: list[str] = []
+    async def handler(inbound, stream):
+        calls.append(inbound.msg_id)
+    adapter.set_handler(handler)
+
+    sent: list[dict] = []
+    async def fake_enqueue(payload):
+        sent.append(payload)
+    adapter._enqueue_write = fake_enqueue           # noqa: SLF001
+
+    def single_frame(msgid: str) -> dict:
+        return {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": f"rq-{msgid}"},
+            "body": {
+                "msgid": msgid,
+                "aibotid": "BOT",
+                "chattype": "single",
+                "from": {"userid": "U-FIFO"},
+                "msgtype": "text",
+                "text": {"content": msgid},
+            },
+        }
+
+    try:
+        await adapter._handle_msg_callback(single_frame("blocked"))  # noqa: SLF001
+    except RuntimeError as exc:
+        assert "blocked_reply" in str(exc)
+    else:
+        raise AssertionError("blocked reply failure was not surfaced")
+
+    settings.private_chat.mode = "open"
+    await adapter._handle_msg_callback(single_frame("next"))         # noqa: SLF001
+
+    print("  handler order after failed blocked reply:", calls)
+    assert calls == ["next"], calls
+    assert any(p["headers"]["req_id"] == "rq-next" for p in sent), sent
+
+
 async def main():
     await test_decrypt_round_trip()
     await test_sniff_extension()
@@ -523,6 +641,8 @@ async def main():
     await test_quote_text()
     await test_quote_image()
     await test_quote_mixed_multi_image_with_group_strip()
+    await test_inbound_prefetch_fifo_dispatch()
+    await test_blocked_private_reply_failure_does_not_block_fifo()
     print("\nALL STAGE-7 SMOKE TESTS PASSED")
 
 

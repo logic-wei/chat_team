@@ -120,6 +120,58 @@ class McpConfig:
 
 
 @dataclass
+class PrivateChatConfig:
+    """Policy for whether the bot replies to single (private) chats.
+
+    Group chats always pass through; only single chats are gated.
+
+    Modes:
+      * ``open``      — reply to everyone
+      * ``closed``    — reply to no one
+      * ``blacklist`` — reply to everyone except ``blacklist``
+      * ``whitelist`` — reply only to ``whitelist`` (DEFAULT — see below)
+
+    Default mode is ``whitelist`` with an empty list, i.e. default-deny:
+    a brand-new install or an upgrade that doesn't add a ``private_chat``
+    block will NOT reply to any private chat until the maintainer explicitly
+    opts in (either by switching ``mode`` or by populating ``whitelist``).
+    Group chats are always served regardless.
+
+    IMPORTANT for upgrades: pre-feature deployments replied to every private
+    chat. After this change, the bot will go silent on private chats until
+    you add ``private_chat: {mode: open}`` (or a populated whitelist). The
+    ``team_admin`` role can still be reached via group chats and the
+    ``chat-team-boss`` CLI (which bypasses this gate entirely).
+
+    ``blocked_reply`` is sent (as a single text message) to a user whose
+    private chat was blocked. Empty string = silent drop. Note: this only
+    gates one-to-one single chats; group chats are unaffected.
+    """
+    mode: str = "whitelist"
+    whitelist: list[str] = field(default_factory=list)
+    blacklist: list[str] = field(default_factory=list)
+    # Default is NON-empty: a default-deny policy that silently drops would
+    # trap users in a dead-end (they can't learn their own userid to ask the
+    # maintainer to whitelist them). The {userid} placeholder is substituted
+    # by the adapter with the blocked sender's WeCom userid, so a brand-new
+    # install self-documents the onboarding path without any config.
+    blocked_reply: str = "私聊未开放。你的企业微信账号是 {userid},请联系管理员将其加入白名单。"
+
+    def allows(self, user_id: str) -> bool:
+        """True if this user_id should receive a reply in a single chat."""
+        if self.mode == "open":
+            return True
+        if self.mode == "closed":
+            return False
+        if self.mode == "blacklist":
+            return user_id not in self.blacklist
+        # "whitelist" or any unrecognised value → fail closed (default-deny).
+        # A typo in config.yaml can't accidentally expose the bot to everyone;
+        # the maintainer simply adds their own userid to whitelist once.
+        return user_id in self.whitelist
+
+
+@dataclass
 class BotConfig:
     """One WeCom bot entry. Solo mode requires ``name`` (= role); team mode doesn't."""
     bot_id: str
@@ -142,6 +194,7 @@ class Settings:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    private_chat: PrivateChatConfig = field(default_factory=PrivateChatConfig)
     team_profile: str = ""
 
 
@@ -151,22 +204,95 @@ def _coerce(target: Any, data: dict[str, Any]) -> None:
             setattr(target, key, value)
 
 
-def load_settings(paths: Paths | None = None) -> Settings:
-    paths = paths or init_home()
-    load_dotenv(paths.dotenv, override=False)
+# --------------------------------------------------------------------------
+# Hot reload
+# --------------------------------------------------------------------------
+# ``reload_settings`` mutates the *existing* ``Settings`` instance in place so
+# every component that already holds a ``self.settings`` reference (Dispatcher,
+# SessionManager, PersistenceManager, Agent, WeComBotAdapter, compactor) sees
+# the new values on its next read — without re-wiring the whole graph.
+#
+# Not everything can be hot-reloaded: anything that baked itself into a
+# long-lived OS-level resource at startup (WebSocket connections for
+# ``bots``, the team/solo ``mode`` switch, MCP subprocesses/SSE sessions, the
+# OpenAI SDK client's ``api_key``/``base_url``/``timeout``/http-debug hooks,
+# and the image-cache singleton's resize knobs) is reported back as
+# ``requires_restart`` instead of being silently swapped. The caller (the
+# SIGHUP handler in ``app.py``) logs these so the maintainer knows a restart
+# is still needed for those fields.
+#
+# Fields that ARE hot-reloadable are read "per turn" or "per message" by the
+# runtime (e.g. ``private_chat`` is consulted on every inbound message,
+# ``llm.chat.model`` on every agent turn, ``team_profile`` on every system
+# prompt rebuild), so swapping them in the shared ``Settings`` instance is
+# sufficient — no re-wiring required.
 
-    raw: dict[str, Any] = {}
-    if paths.config_yaml.exists():
+
+# Top-level Settings fields whose values are determined by *live OS resources*
+# (open sockets, spawned subprocesses, constructed SDK clients) and therefore
+# cannot be swapped without tearing those resources down. ``reload_settings``
+# detects divergence in these and reports it instead of applying it.
+_REQUIRES_RESTART_TOP = frozenset({"mode", "bots", "workspace_root", "mcp"})
+
+# Nested ``settings.llm`` fields that the live ``OpenAIChatCompletionProvider``
+# has already baked into its constructed ``AsyncOpenAI`` client / ``httpx``
+# client. The provider's ``apply_runtime_overrides`` covers the *other* llm
+# knobs; these stay restart-only.
+_LLM_REQUIRES_RESTART = frozenset({
+    "api_key", "base_url",
+    "request_timeout_seconds", "http_debug_log_enabled",
+})
+
+# Nested ``settings.llm.vision`` fields that the process-level
+# ``ImageDataURICache`` singleton baked in at startup. ``configure_default_cache``
+# is re-invoked on reload for the *other* vision cache knobs, but api_key /
+# base_url feed the vision provider construction.
+_VISION_REQUIRES_RESTART = frozenset({"api_key", "base_url"})
+
+
+@dataclass
+class ReloadReport:
+    """Result of a ``reload_settings`` call.
+
+    ``applied`` lists top-level/nested field paths whose new value was written
+    into the live ``Settings`` (and will be picked up on the next read).
+    ``requires_restart`` lists field paths whose value diverged but cannot be
+    applied hot — the maintainer must ``--stop`` and restart for those.
+    ``errors`` is non-empty only if the YAML/file read itself failed (in which
+    case nothing was applied).
+    """
+    applied: list[str] = field(default_factory=list)
+    requires_restart: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+    def summary(self) -> str:
+        if self.errors:
+            return "reload FAILED: " + "; ".join(self.errors)
+        parts = []
+        if self.applied:
+            parts.append("applied=[" + ", ".join(self.applied) + "]")
+        if self.requires_restart:
+            parts.append("requires_restart=[" + ", ".join(self.requires_restart) + "]")
+        return "reload OK; " + (" ".join(parts) if parts else "no changes")
+
+
+def _parse_raw(paths: Paths) -> dict[str, Any]:
+    """Read config.yaml → dict. Missing/unparseable → empty dict (with a log)."""
+    if not paths.config_yaml.exists():
+        return {}
+    try:
         loaded = yaml.safe_load(paths.config_yaml.read_text(encoding="utf-8")) or {}
-        if isinstance(loaded, dict):
-            raw = loaded
+    except yaml.YAMLError:
+        _log.exception("config.yaml parse failed during reload; keeping old config")
+        raise
+    return loaded if isinstance(loaded, dict) else {}
 
-    workspace_root_raw = raw.get("workspace_root", "workspaces")
-    workspace_root = Path(workspace_root_raw)
-    if not workspace_root.is_absolute():
-        workspace_root = paths.home / workspace_root
 
-    mode = raw.get("mode", "team")
+def _build_bots(raw: dict[str, Any]) -> list[BotConfig]:
     bots: list[BotConfig] = []
     if isinstance(raw.get("bots"), list):
         for b in raw["bots"]:
@@ -176,13 +302,72 @@ def load_settings(paths: Paths | None = None) -> Settings:
                     secret=str(b["secret"]),
                     name=str(b.get("name", "")),
                 ))
+    return bots
+
+
+def _build_mcp(raw: dict[str, Any]) -> McpConfig:
+    if not isinstance(raw.get("mcp"), dict):
+        return McpConfig()
+    servers_raw = raw["mcp"].get("servers")
+    if not isinstance(servers_raw, dict):
+        return McpConfig()
+    mcp_servers: list[McpServerConfig] = []
+    for srv_name, srv_cfg in servers_raw.items():
+        if not isinstance(srv_cfg, dict):
+            continue
+        cfg = McpServerConfig(
+            name=str(srv_name),
+            command=srv_cfg.get("command", ""),
+            args=list(srv_cfg.get("args") or []),
+            env=dict(srv_cfg.get("env") or {}),
+            url=srv_cfg.get("url", ""),
+        )
+        try:
+            cfg.validate()
+            mcp_servers.append(cfg)
+        except ValueError:
+            _log.warning("skipping invalid mcp server %r", srv_name, exc_info=True)
+    return McpConfig(servers=mcp_servers)
+
+
+def _build_private_chat(raw: dict[str, Any]) -> PrivateChatConfig:
+    pc_raw = raw.get("private_chat")
+    if not isinstance(pc_raw, dict):
+        return PrivateChatConfig()
+    valid_modes = {"open", "closed", "blacklist", "whitelist"}
+    mode = str(pc_raw.get("mode", "whitelist")).strip().lower()
+    if mode not in valid_modes:
+        _log.warning(
+            "private_chat.mode=%r is not one of %s; defaulting to 'whitelist'",
+            pc_raw.get("mode"), sorted(valid_modes),
+        )
+        mode = "whitelist"
+    return PrivateChatConfig(
+        mode=mode,
+        whitelist=[str(u).strip() for u in (pc_raw.get("whitelist") or []) if str(u).strip()],
+        blacklist=[str(u).strip() for u in (pc_raw.get("blacklist") or []) if str(u).strip()],
+        blocked_reply=str(pc_raw.get("blocked_reply", "") or ""),
+    )
+
+
+def _build_settings_from_raw(raw: dict[str, Any], paths: Paths) -> Settings:
+    """Construct a brand-new ``Settings`` from a parsed raw dict + paths.
+
+    Shared by ``load_settings`` (initial load) and ``reload_settings`` (which
+    builds a temp instance from this, then copies safe fields into the live
+    one in place).
+    """
+    workspace_root_raw = raw.get("workspace_root", "workspaces")
+    workspace_root = Path(workspace_root_raw)
+    if not workspace_root.is_absolute():
+        workspace_root = paths.home / workspace_root
 
     settings = Settings(
         paths=paths,
         workspace_root=workspace_root,
         default_role=raw.get("default_role", "team_admin"),
-        mode=mode,
-        bots=bots,
+        mode=raw.get("mode", "team"),
+        bots=_build_bots(raw),
         log_level=raw.get("log_level", "INFO"),
     )
     if isinstance(raw.get("session"), dict):
@@ -195,8 +380,7 @@ def load_settings(paths: Paths | None = None) -> Settings:
         llm_raw = raw["llm"]
         assert isinstance(llm_raw, dict)
         _coerce(settings.llm, {
-            k: v for k, v in llm_raw.items()
-            if k not in {"chat", "vision"}
+            k: v for k, v in llm_raw.items() if k not in {"chat", "vision"}
         })
         if isinstance(llm_raw.get("chat"), dict):
             _coerce(settings.llm.chat, llm_raw["chat"])
@@ -206,30 +390,10 @@ def load_settings(paths: Paths | None = None) -> Settings:
         _coerce(settings.logging, raw["logging"])
     if isinstance(raw.get("cleanup"), dict):
         _coerce(settings.cleanup, raw["cleanup"])
+    settings.private_chat = _build_private_chat(raw)
+    settings.mcp = _build_mcp(raw)
 
-    if isinstance(raw.get("mcp"), dict):
-        servers_raw = raw["mcp"].get("servers")
-        if isinstance(servers_raw, dict):
-            mcp_servers: list[McpServerConfig] = []
-            for srv_name, srv_cfg in servers_raw.items():
-                if not isinstance(srv_cfg, dict):
-                    continue
-                cfg = McpServerConfig(
-                    name=str(srv_name),
-                    command=srv_cfg.get("command", ""),
-                    args=list(srv_cfg.get("args") or []),
-                    env=dict(srv_cfg.get("env") or {}),
-                    url=srv_cfg.get("url", ""),
-                )
-                try:
-                    cfg.validate()
-                    mcp_servers.append(cfg)
-                except ValueError:
-                    _log.warning("skipping invalid mcp server %r", srv_name, exc_info=True)
-            settings.mcp = McpConfig(servers=mcp_servers)
-
-    # Backward compat: if no bots configured in YAML, auto-construct one
-    # from WECOM_BOT_ID / WECOM_SECRET env vars (loaded from .env above).
+    # Backward compat: no bots in YAML → synthesize from WECOM_* env vars.
     if not settings.bots:
         env_bot_id = os.environ.get("WECOM_BOT_ID", "")
         env_secret = os.environ.get("WECOM_SECRET", "")
@@ -238,5 +402,128 @@ def load_settings(paths: Paths | None = None) -> Settings:
 
     if paths.team_md.exists():
         settings.team_profile = paths.team_md.read_text(encoding="utf-8").strip()
+    else:
+        settings.team_profile = ""
     workspace_root.mkdir(parents=True, exist_ok=True)
     return settings
+
+
+def load_settings(paths: Paths | None = None) -> Settings:
+    paths = paths or init_home()
+    load_dotenv(paths.dotenv, override=False)
+    raw = _parse_raw(paths)
+    return _build_settings_from_raw(raw, paths)
+
+
+def _values_differ(a: Any, b: Any) -> bool:
+    """True if ``a`` and ``b`` should be treated as different for reload diffing.
+
+    Uses ``!=`` first (so ``10`` and ``10.0`` compare equal — YAML ints and
+    dataclass float defaults shouldn't trip a false "changed"). Falls back to
+    ``repr`` comparison for types whose ``!=`` raises or returns a non-bool
+    (e.g. some numpy-style objects); we don't ship any, but the guard keeps
+    the diff robust against future field types.
+    """
+    try:
+        ne = (a != b)
+    except Exception:  # noqa: BLE001
+        return repr(a) != repr(b)
+    if isinstance(ne, bool):
+        return ne
+    # Truthy non-bool (e.g. array-like) → fall back to repr.
+    return repr(a) != repr(b)
+
+
+def _apply_safe_nested(dst: Any, src: Any, prefix: str, restart_keys: frozenset[str],
+                       report: ReloadReport) -> None:
+    """Copy each field from ``src`` into ``dst`` (both dataclasses), diffing.
+
+    Fields in ``restart_keys`` are *not* copied — divergence is reported as
+    requires_restart instead. Everything else is copied and, if it changed,
+    appended to ``report.applied`` as ``prefix.field``.
+    """
+    for fname in dst.__dataclass_fields__:
+        old = getattr(dst, fname)
+        new = getattr(src, fname)
+        if fname in restart_keys:
+            if _values_differ(old, new):
+                report.requires_restart.append(f"{prefix}.{fname}")
+            continue
+        if _values_differ(old, new):
+            setattr(dst, fname, new)
+            report.applied.append(f"{prefix}.{fname}")
+
+
+def reload_settings(settings: Settings) -> ReloadReport:
+    """Re-read ``config.yaml`` + ``team.md`` and mutate ``settings`` in place.
+
+    Returns a ``ReloadReport`` describing what was applied vs. what needs a
+    restart. On a YAML parse error, nothing is mutated and ``report.errors``
+    is populated.
+
+    The ``settings.paths`` object is reused as-is (it's tied to the home dir
+    which doesn't change). Structural fields (``mode``, ``bots``,
+    ``workspace_root``, ``mcp``) are compared but NOT applied — they require
+    a process restart because they're bound to live sockets/subprocesses.
+    """
+    report = ReloadReport()
+    paths = settings.paths
+    try:
+        raw = _parse_raw(paths)
+    except Exception as exc:  # noqa: BLE001
+        report.errors.append(f"config.yaml: {exc!r}")
+        return report
+    fresh = _build_settings_from_raw(raw, paths)
+
+    # --- structural (restart-only) top-level fields -------------------------
+    for fname in _REQUIRES_RESTART_TOP:
+        old = getattr(settings, fname)
+        new = getattr(fresh, fname)
+        if _values_differ(old, new):
+            report.requires_restart.append(fname)
+
+    # --- safe top-level scalars --------------------------------------------
+    for fname in ("default_role", "log_level", "team_profile"):
+        old = getattr(settings, fname)
+        new = getattr(fresh, fname)
+        if _values_differ(old, new):
+            setattr(settings, fname, new)
+            report.applied.append(fname)
+
+    # --- safe nested dataclasses -------------------------------------------
+    _apply_safe_nested(settings.session, fresh.session, "session",
+                       restart_keys=frozenset(), report=report)
+    _apply_safe_nested(settings.notebook, fresh.notebook, "notebook",
+                       restart_keys=frozenset(), report=report)
+    _apply_safe_nested(settings.tools, fresh.tools, "tools",
+                       restart_keys=frozenset(), report=report)
+    _apply_safe_nested(settings.logging, fresh.logging, "logging",
+                       restart_keys=frozenset(), report=report)
+    _apply_safe_nested(settings.cleanup, fresh.cleanup, "cleanup",
+                       restart_keys=frozenset(), report=report)
+
+    # private_chat is a single dataclass instance referenced by the adapter;
+    # replace the whole object so ``adapter.settings.private_chat`` picks up
+    # the new mode/whitelist on the next message.
+    if settings.private_chat != fresh.private_chat:
+        settings.private_chat = fresh.private_chat
+        report.applied.append("private_chat")
+
+    # llm: chat sub-config is fully safe (read per turn).
+    _apply_safe_nested(settings.llm.chat, fresh.llm.chat, "llm.chat",
+                       restart_keys=frozenset(), report=report)
+    # llm: vision sub-config — api_key/base_url are restart-only (vision
+    # provider is already constructed); the rest (strategy/image_detail/
+    # oversized_image/resize_*/max_inline_bytes/model) we copy. The cache
+    # singleton is re-configured by the caller (app.Reloader) for the resize
+    # knobs.
+    _apply_safe_nested(settings.llm.vision, fresh.llm.vision, "llm.vision",
+                       restart_keys=_VISION_REQUIRES_RESTART, report=report)
+    # llm: top-level — api_key/base_url/request_timeout/http_debug are
+    # restart-only (baked into AsyncOpenAI client); debug_log_enabled /
+    # use_streaming / max_retries / retry_initial_delay are picked up by the
+    # provider's apply_runtime_overrides (called by app.Reloader).
+    _apply_safe_nested(settings.llm, fresh.llm, "llm",
+                       restart_keys=_LLM_REQUIRES_RESTART, report=report)
+
+    return report

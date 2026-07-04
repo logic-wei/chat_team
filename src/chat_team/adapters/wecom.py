@@ -24,6 +24,7 @@ import random
 import re
 import time
 import uuid
+from dataclasses import dataclass, field
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
@@ -51,6 +52,7 @@ WECOM_WS_URL = "wss://openws.work.weixin.qq.com"
 HEARTBEAT_INTERVAL = 30
 STREAM_PUSH_MIN_INTERVAL = 1.0          # seconds between intermediate stream frames
 WRITE_QUEUE_MAXSIZE = 1024
+INBOUND_PREFETCH_TIMEOUT_SECONDS = 240.0
 
 # Reconnect backoff: 1s, 2s, 4s, … capped at 5 min; +0.5s jitter per attempt.
 RECONNECT_INITIAL_DELAY = 1.0
@@ -100,6 +102,36 @@ class _LRU(OrderedDict):
         if len(self) > self.capacity:
             self.popitem(last=False)
         return True
+
+
+@dataclass
+class _InboundTurn:
+    """One inbound message after the reader has assigned its FIFO slot.
+
+    Media resolution runs concurrently across turns, but dispatcher entry is
+    released by ``seq`` so user-visible model processing stays in receive
+    order for each session.
+    """
+
+    session_id: str
+    seq: int
+    frame: dict[str, Any]
+    inbound: IncomingMessage
+    msgtype: str
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    drop: bool = False
+    timed_out: bool = False
+
+
+@dataclass
+class _InboundQueue:
+    next_seq: int = 0
+    dispatch_seq: int = 0
+    turns: dict[int, _InboundTurn] = field(default_factory=dict)
+    skipped: set[int] = field(default_factory=set)
+    cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+    worker: asyncio.Task | None = None
 
 
 class WeComStreamHandle:
@@ -204,6 +236,10 @@ class WeComBotAdapter(BotAdapter):
         # silently disappear under load. Spans reconnects so an in-flight
         # turn survives a brief WS blip.
         self._bg_tasks: set[asyncio.Task] = set()
+        # Per-session inbound ordering. Message media is prefetched by the
+        # callback tasks concurrently, while model dispatch is released in
+        # the exact order the reader assigned these sequence numbers.
+        self._inbound_queues: dict[str, _InboundQueue] = {}
         # Per-connection state (rebuilt each connect iteration) ---------
         self._ws: Any = None
         self._write_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(WRITE_QUEUE_MAXSIZE)
@@ -391,8 +427,9 @@ class WeComBotAdapter(BotAdapter):
                     continue
                 cmd = msg.get("cmd") or ""
                 if cmd == "aibot_msg_callback":
+                    order_key = self._reserve_inbound_order(msg)
                     self._spawn_bg(
-                        self._handle_msg_callback(msg), name="wecom-msg-cb",
+                        self._handle_msg_callback(msg, order_key), name="wecom-msg-cb",
                     )
                 elif cmd == "aibot_event_callback":
                     self._spawn_bg(
@@ -423,57 +460,222 @@ class WeComBotAdapter(BotAdapter):
         task.add_done_callback(self._bg_tasks.discard)
         return task
 
-    # ---- message dispatch -------------------------------------------------
+    def _queue_for(self, session_id: str) -> _InboundQueue:
+        q = self._inbound_queues.get(session_id)
+        if q is None:
+            q = _InboundQueue()
+            self._inbound_queues[session_id] = q
+        return q
 
-    async def _handle_msg_callback(self, frame: dict[str, Any]) -> None:
-        body = frame.get("body") or {}
-        msg_id = body.get("msgid") or ""
-        if msg_id and not self._msgid_lru.add(msg_id):
-            log.info("dedup msgid=%s", msg_id)
+    def _reserve_inbound_order(self, frame: dict[str, Any]) -> tuple[str, int] | None:
+        session_id = self._session_id_from_body(frame.get("body") or {})
+        if session_id is None:
+            return None
+        q = self._queue_for(session_id)
+        seq = q.next_seq
+        q.next_seq += 1
+        return session_id, seq
+
+    async def _skip_inbound_order(self, order_key: tuple[str, int] | None) -> None:
+        if order_key is None:
             return
+        session_id, seq = order_key
+        q = self._queue_for(session_id)
+        async with q.cond:
+            q.skipped.add(seq)
+            if q.worker is None or q.worker.done():
+                q.worker = self._spawn_bg(
+                    self._inbound_worker(session_id),
+                    name=f"wecom-inbound-worker-{session_id}",
+                )
+            q.cond.notify_all()
+
+    async def _enqueue_inbound_turn(self, turn: _InboundTurn) -> None:
+        q = self._queue_for(turn.session_id)
+        async with q.cond:
+            q.turns[turn.seq] = turn
+            if q.worker is None or q.worker.done():
+                q.worker = self._spawn_bg(
+                    self._inbound_worker(turn.session_id),
+                    name=f"wecom-inbound-worker-{turn.session_id}",
+                )
+            q.cond.notify_all()
+
+    async def _mark_inbound_ready(self, turn: _InboundTurn) -> None:
+        turn.ready.set()
+        q = self._queue_for(turn.session_id)
+        async with q.cond:
+            q.cond.notify_all()
+
+    async def _inbound_worker(self, session_id: str) -> None:
+        q = self._queue_for(session_id)
         try:
-            inbound = self._parse_metadata(frame)
-        except Exception:                                    # noqa: BLE001
-            log.exception("failed to parse callback")
-            return
-        if inbound is None:
-            return                                           # unsupported msgtype, already logged
+            while not self._shutdown.is_set():
+                async with q.cond:
+                    await q.cond.wait_for(
+                        lambda: (
+                            self._shutdown.is_set()
+                            or q.dispatch_seq in q.skipped
+                            or q.dispatch_seq in q.turns
+                        )
+                    )
+                    if self._shutdown.is_set():
+                        return
+                    if q.dispatch_seq in q.skipped:
+                        q.skipped.remove(q.dispatch_seq)
+                        q.dispatch_seq += 1
+                        if not q.turns and not q.skipped and q.dispatch_seq == q.next_seq:
+                            self._inbound_queues.pop(session_id, None)
+                            return
+                        q.cond.notify_all()
+                        continue
+                    turn = q.turns[q.dispatch_seq]
 
-        msgtype = body.get("msgtype") or "text"
-        try:
-            blocks = await self._resolve_inbound_blocks(
-                body, msgtype, inbound.session_id, inbound.chat_type,
-            )
-        except Exception:                                    # noqa: BLE001
-            log.exception("failed to resolve inbound blocks for msgtype=%s", msgtype)
-            blocks = [{"type": "text",
-                       "text": f"[用户发来 {msgtype},但下载/解密失败]"}]
-        if blocks is None:
-            log.info("unsupported msgtype=%s; ignoring", msgtype)
-            return
-        blocks = coalesce_text_blocks(blocks)
-        if not blocks:
-            blocks = [{"type": "text", "text": "(空消息)"}]
-        inbound.content_blocks = blocks
-        inbound.text = blocks_to_text(blocks)
+                try:
+                    await asyncio.wait_for(
+                        turn.ready.wait(), timeout=INBOUND_PREFETCH_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "inbound media prefetch timed out: session=%s seq=%d msgtype=%s",
+                        session_id, turn.seq, turn.msgtype,
+                    )
+                    turn.timed_out = True
+                    turn.inbound.content_blocks = [{
+                        "type": "text",
+                        "text": f"[用户发来 {turn.msgtype},但媒体下载超时]",
+                    }]
+                    turn.inbound.text = blocks_to_text(turn.inbound.content_blocks)
+                    turn.ready.set()
 
+                try:
+                    if not turn.drop:
+                        await self._dispatch_ready_turn(turn)
+                finally:
+                    turn.done.set()
+                    async with q.cond:
+                        q.turns.pop(q.dispatch_seq, None)
+                        q.dispatch_seq += 1
+                        if not q.turns and not q.skipped and q.dispatch_seq == q.next_seq:
+                            self._inbound_queues.pop(session_id, None)
+                            return
+                        q.cond.notify_all()
+        finally:
+            if self._inbound_queues.get(session_id) is q:
+                q.worker = None
+
+    async def _dispatch_ready_turn(self, turn: _InboundTurn) -> None:
         handler = self._handler
         if handler is None:
             log.error("no handler registered; dropping message")
             return
 
-        stream = WeComStreamHandle(self, req_id=inbound.reply_token)
-        # Initial 思考中 frame so the user sees something immediately.
+        stream = WeComStreamHandle(self, req_id=turn.inbound.reply_token)
+        # Initial 思考中 frame is sent only when this message reaches the
+        # FIFO dispatch head. Later text messages no longer appear to start
+        # processing before earlier media messages.
         await stream._send_frame("思考中…", finish=False)
 
         try:
-            await handler(inbound, stream)
+            await handler(turn.inbound, stream)
         except Exception:                                    # noqa: BLE001
             log.exception("handler raised")
             try:
                 await stream.finish("(系统错误,请稍后再试)")
             except Exception:                                # noqa: BLE001
                 pass
+
+    # ---- message dispatch -------------------------------------------------
+
+    async def _handle_msg_callback(
+        self,
+        frame: dict[str, Any],
+        order_key: tuple[str, int] | None = None,
+    ) -> None:
+        if order_key is None:
+            order_key = self._reserve_inbound_order(frame)
+        order_consumed = False
+        try:
+            body = frame.get("body") or {}
+            msg_id = body.get("msgid") or ""
+            if msg_id and not self._msgid_lru.add(msg_id):
+                log.info("dedup msgid=%s", msg_id)
+                await self._skip_inbound_order(order_key)
+                order_consumed = True
+                return
+            try:
+                inbound = self._parse_metadata(frame)
+            except Exception:                                # noqa: BLE001
+                log.exception("failed to parse callback")
+                await self._skip_inbound_order(order_key)
+                order_consumed = True
+                return
+            if inbound is None:
+                await self._skip_inbound_order(order_key)
+                order_consumed = True
+                return                                       # unsupported msgtype, already logged
+
+            # Private-chat policy gate. Group chats always pass through;
+            # only single chats are filtered by ``private_chat`` in config.yaml.
+            # Done BEFORE the 思考中 frame so a blocked user doesn't see the
+            # "thinking..." spinner forever.
+            if inbound.chat_type == ChatType.SINGLE:
+                pc = self.settings.private_chat
+                if not pc.allows(inbound.user_id):
+                    log.info(
+                        "private chat blocked: user=%s mode=%s",
+                        inbound.user_id, pc.mode,
+                    )
+                    try:
+                        await self._reply_blocked(
+                            inbound.reply_token, pc.blocked_reply, inbound.user_id,
+                        )
+                    finally:
+                        await self._skip_inbound_order(order_key)
+                        order_consumed = True
+                    return
+
+            msgtype = body.get("msgtype") or "text"
+            if order_key is None:
+                log.error("unable to assign inbound order; dropping msgid=%s", msg_id)
+                return
+            _, seq = order_key
+            turn = _InboundTurn(
+                session_id=inbound.session_id,
+                seq=seq,
+                frame=frame,
+                inbound=inbound,
+                msgtype=msgtype,
+            )
+            await self._enqueue_inbound_turn(turn)
+            order_consumed = True
+            try:
+                blocks = await self._resolve_inbound_blocks(
+                    body, msgtype, inbound.session_id, inbound.chat_type,
+                )
+            except Exception:                                # noqa: BLE001
+                log.exception("failed to resolve inbound blocks for msgtype=%s", msgtype)
+                blocks = [{"type": "text",
+                           "text": f"[用户发来 {msgtype},但下载/解密失败]"}]
+            if turn.timed_out:
+                await turn.done.wait()
+                return
+            if blocks is None:
+                log.info("unsupported msgtype=%s; ignoring", msgtype)
+                turn.drop = True
+                await self._mark_inbound_ready(turn)
+                await turn.done.wait()
+                return
+            blocks = coalesce_text_blocks(blocks)
+            if not blocks:
+                blocks = [{"type": "text", "text": "(空消息)"}]
+            inbound.content_blocks = blocks
+            inbound.text = blocks_to_text(blocks)
+            await self._mark_inbound_ready(turn)
+            await turn.done.wait()
+        finally:
+            if order_key is not None and not order_consumed:
+                await self._skip_inbound_order(order_key)
 
     def _parse_metadata(self, frame: dict[str, Any]) -> IncomingMessage | None:
         body = frame.get("body") or {}
@@ -587,17 +789,34 @@ class WeComBotAdapter(BotAdapter):
 
         if msgtype == "mixed":
             items = (payload.get("mixed") or {}).get("msg_item") or []
-            # Sequential iteration (rather than asyncio.gather) keeps things
-            # simple; ordering is preserved by construction. WeCom rarely
-            # delivers more than a handful of items per mixed message.
-            blocks: list[ContentBlock] = []
-            for i, it in enumerate(items):
+            # Download all sub-trees CONCURRENTLY rather than serially.
+            #
+            # Why: WeCom image download URLs expire ~5 minutes after the
+            # callback is delivered. The old serial loop downloaded one
+            # image at a time; with N × ~1MB images (e.g. a 9-photo vehicle
+            # inspection burst) the cumulative wall time exceeded the URL
+            # lifetime, so the tail URLs 404'd and the user saw
+            # ``[图片下载失败]`` placeholders for items they did send.
+            # Concurrent download parallelises the wait so all URLs are
+            # fetched inside their validity window.
+            #
+            # Order is preserved: ``asyncio.gather`` returns results in
+            # input order, so the assembled block list matches the user's
+            # photo order.
+            async def _flatten_one(i: int, it: dict[str, Any]) -> list[ContentBlock]:
                 it_type = it.get("msgtype") or ""
                 sub = await self._flatten_payload(
                     it, it_type, session_id, msg_id, idx=i,
                 )
                 if not sub and it_type:
                     sub = [{"type": "text", "text": f"[未支持的 mixed 子项: {it_type}]"}]
+                return sub
+
+            sub_lists = await asyncio.gather(
+                *(_flatten_one(i, it) for i, it in enumerate(items))
+            )
+            blocks: list[ContentBlock] = []
+            for sub in sub_lists:
                 blocks.extend(sub)
             return blocks
 
@@ -760,6 +979,19 @@ class WeComBotAdapter(BotAdapter):
         if msg_id and not self._msgid_lru.add(msg_id):
             return
         if event == "enter_chat":
+            # Apply the same private-chat policy gate to enter_chat welcomes
+            # so a blocked user doesn't see the welcome message even though
+            # their subsequent messages would be dropped.
+            chat_type_raw = body.get("chattype") or "single"
+            from_user = (body.get("from") or {}).get("userid") or ""
+            if chat_type_raw != "group":
+                pc = self.settings.private_chat
+                if from_user and not pc.allows(from_user):
+                    log.info(
+                        "enter_chat blocked (single): user=%s mode=%s",
+                        from_user, pc.mode,
+                    )
+                    return
             session_id = self._session_id_from_body(body)
             await self._reply_welcome(headers.get("req_id"), session_id)
         elif event == "disconnected_event":
@@ -819,3 +1051,52 @@ class WeComBotAdapter(BotAdapter):
             "body": {"msgtype": "text", "text": {"content": welcome}},
         }
         await self._enqueue_write(payload)
+
+    async def _reply_blocked(
+        self,
+        req_id: str | None,
+        text: str,
+        user_id: str = "",
+    ) -> None:
+        """Send a single text reply to a blocked private chat.
+
+        ``text`` is treated as a template and supports one placeholder:
+
+          ``{userid}`` — replaced with the blocked sender's WeCom ``userid``
+                         (the same value used by ``private_chat.whitelist``
+                         / ``blacklist``).
+
+        The {userid} placeholder exists because end users have no way to
+        learn their own WeCom userid (it isn't surfaced in the client) yet
+        the maintainer needs that exact string to add them to whitelist.
+        A common pattern is:
+
+            blocked_reply: "私聊未开放。你的企业微信账号是 {userid},请联系管理员开通。"
+
+        — the user sends one message and immediately learns the string to
+        hand to the maintainer.
+
+        When ``text`` is empty the message is silently dropped — appropriate
+        for ``closed`` mode where you want no feedback.
+        """
+        if not text:
+            return
+        # str.format with an explicit mapping (not **locals) so a literal
+        # stray ``{`` in the text can't raise and so unknown placeholders
+        # survive verbatim rather than blowing up the reply path.
+        try:
+            content = text.format(userid=user_id)
+        except (KeyError, IndexError):
+            # Unknown placeholder like {foo} — render literally so a typo
+            # in config.yaml can't take the bot's reply path down.
+            content = text.replace("{userid}", user_id)
+        # IMPORTANT: replies to ``aibot_msg_callback`` MUST use the stream
+        # frame format (msgtype=stream, finish=true). A plain msgtype=text
+        # frame is silently dropped by WeCom for ordinary message callbacks
+        # (text frames only work for ``aibot_respond_welcome_msg`` welcome
+        # events). Reuse ``WeComStreamHandle`` — the same path the normal
+        # handler uses — to deliver a single finished stream frame; this is
+        # the only format WeCom honours here.
+        stream = WeComStreamHandle(self, req_id=req_id)
+        await stream.finish(content)
+        log.info("blocked_reply delivered: user=%s", user_id)

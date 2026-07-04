@@ -75,6 +75,114 @@ def _clean_skill_name(raw: str) -> str:
     return s
 
 
+def _last_user_text(ctx: ToolContext) -> str:
+    """Return the most recent user message text in the calling agent's history.
+
+    Used by the trigger-keyword gate. Falls back to "" if no agent / no
+    user message is found (in which case the gate trivially blocks — safe
+    default for a default-deny policy).
+    """
+    role_name = ctx.session.current_role
+    agent = ctx.session.agents_by_role.get(role_name)
+    if agent is None:
+        return ""
+    # agent.history is user/assistant/tool only (system rebuilt per turn).
+    # Walk from the end to find the latest user entry.
+    #
+    # NOTE: in production, history holds ChatMessage dataclass instances
+    # (attribute access); in some smokes/tests it holds plain dicts. Be
+    # tolerant of both shapes so this helper is robust against future
+    # message-type changes.
+    def _get(msg, key, default=None):
+        if isinstance(msg, dict):
+            return msg.get(key, default)
+        return getattr(msg, key, default)
+    for msg in reversed(agent.history):
+        if _get(msg, "role") != "user":
+            continue
+        content = _get(msg, "content")
+        if isinstance(content, list):
+            # Vision blocks: render via blocks_to_text for keyword scan.
+            from ...adapters.base import blocks_to_text
+            return blocks_to_text(content)
+        if isinstance(content, str):
+            return content
+        return str(content) if content is not None else ""
+    return ""
+
+
+def _blocked_skill_error(skill) -> ToolError:
+    """Build the standard ToolError for a trigger-keyword-gated skill that
+    was attempted without a matching keyword in the latest user message.
+
+    The message is shaped so the LLM can relay it to the user (it contains
+    the trigger keywords and a hint to ask the user).
+    """
+    keywords_disp = " / ".join(skill.trigger_keywords)
+    first_kw = skill.trigger_keywords[0]
+    return ToolError(
+        f"能力 {skill.name!r} 是受触发词保护的:必须看到用户消息里出现下列任一关键词才允许使用 "
+        f"—— {keywords_disp} ——当前用户消息里没有。"
+        f"请直接回答用户(例如告知已提取到的信息),并提示『如需{first_kw},"
+        f"请回复该关键词』,不要尝试通过 skill 工具或 run_command 调用此能力。"
+    )
+
+
+def assert_skill_unlocked(skill, ctx: ToolContext) -> None:
+    """Raise ToolError if the skill is trigger-keyword protected AND the most
+    recent user message contains none of the keywords. No-op for skills
+    without trigger_keywords (the common case)."""
+    if not skill.trigger_keywords:
+        return
+    user_text = _last_user_text(ctx).lower()
+    if any(kw.lower() in user_text for kw in skill.trigger_keywords):
+        return
+    raise _blocked_skill_error(skill)
+
+
+def scan_command_for_protected_skills(
+    command: str,
+    skills: "SkillRegistry",
+    ctx: ToolContext,
+) -> None:
+    """For each trigger-keyword-protected skill, check if ``command``
+    references its skill directory. If so, enforce the same trigger-keyword
+    gate as :func:`assert_skill_unlocked`.
+
+    This blocks the "bypass" path where the LLM avoids the protected
+    ``skill(name=...)`` tool and instead runs the skill's scripts directly
+    via ``run_command`` (e.g. ``cd ~/.chat_team/skills/<name> && python
+    gen.py``). Reference detection is intentionally broad:
+
+      * the absolute resolved directory path (``.../skills/inspection-report``)
+      * the ``skills/<name>/`` substring (catches ``~``/``$HOME``/``./`` prefixes)
+      * ``<name>/SKILL.md`` or ``<name>/scripts/`` (catches relative refs)
+
+    False positives are acceptable here — they fall back to the same
+    trigger-keyword gate as the legitimate path, so a real user request
+    that mentions the skill name will still pass.
+    """
+    for skill in skills.all():
+        if not skill.trigger_keywords:
+            continue
+        dir_str = str(skill.directory)
+        name = skill.name
+        # Reference patterns to flag.
+        patterns = (
+            dir_str,                       # absolute path
+            f"skills/{name}/",             # ~/.chat_team/skills/<name>/...
+            f"skills/{name}\\",          # windows-style (defensive)
+            f"{name}/SKILL.md",
+            f"{name}/scripts/",
+            f"skills\\{name}\\",
+        )
+        if any(p in command for p in patterns):
+            # Looks like an attempt to invoke the protected skill via shell.
+            # Apply the same gate as the skill() tool.
+            assert_skill_unlocked(skill, ctx)
+            return  # only one match needed; assert_skill_unlocked raises if blocked
+
+
 def _resolve_skill_name_or_raise(raw_name: Any, skills: SkillRegistry) -> str:
     """Resolve a user/model-provided name to a concrete registry key."""
     if not isinstance(raw_name, str) or not raw_name.strip():
@@ -141,6 +249,8 @@ class SkillTool(Tool):
                 f"白名单: {', '.join(allowed) if allowed else '(空)'}"
             )
         skill = self._skills.get(name)
+        # Hard trigger-keyword gate (extracted helper, shared with RunCommandTool).
+        assert_skill_unlocked(skill, ctx)
         body = skill.body
         aux = _list_aux_files(skill.directory)
         work_dir = ctx.cwd.resolve()

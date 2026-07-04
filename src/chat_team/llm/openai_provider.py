@@ -245,6 +245,43 @@ class OpenAIChatCompletionProvider(LLMProvider):
         self._retry_initial_delay = max(0.0, float(retry_initial_delay))
         self._use_streaming = bool(use_streaming)
 
+
+    def apply_runtime_overrides(
+        self,
+        *,
+        debug_log_enabled: bool,
+        use_streaming: bool,
+        max_retries: int,
+        retry_initial_delay: float,
+    ) -> list[str]:
+        """Hot-apply the four runtime knobs that aren't baked into the client.
+
+        ``api_key`` / ``base_url`` / ``request_timeout_seconds`` /
+        ``http_debug_log_enabled`` are baked into the constructed
+        ``AsyncOpenAI`` + ``httpx.AsyncClient`` at ``__init__`` time and cannot
+        be swapped without rebuilding the client — the reloader reports those
+        as ``requires_restart``. The four knobs here are plain attributes the
+        provider reads per call, so they're safe to mutate live.
+
+        Returns the list of knobs whose value actually changed.
+        """
+        changed: list[str] = []
+        if self._debug_log_enabled != debug_log_enabled:
+            self._debug_log_enabled = debug_log_enabled
+            changed.append("debug_log_enabled")
+        if self._use_streaming != use_streaming:
+            self._use_streaming = use_streaming
+            changed.append("use_streaming")
+        new_max = max(1, int(max_retries))
+        if self._max_retries != new_max:
+            self._max_retries = new_max
+            changed.append("max_retries")
+        new_delay = max(0.0, float(retry_initial_delay))
+        if self._retry_initial_delay != new_delay:
+            self._retry_initial_delay = new_delay
+            changed.append("retry_initial_delay")
+        return changed
+
     @staticmethod
     def _build_tool_calls_from_deltas(
         tool_calls_by_index: dict[int, dict[str, str]],

@@ -10,8 +10,14 @@ A WeCom (企业微信) AI Bot that fronts a team of role-differentiated "virtual
 
 ```bash
 # Run the bot (long-connection WeCom WebSocket).
+# Default runs as a background daemon (double-fork, survives SSH disconnect):
+#   stdout/stderr → ~/.chat_team/logs/chat_team.out   (prints + uncaught tracebacks)
+#   PID           → ~/.chat_team/chat_team.pid        (removed on clean exit)
 # First run seeds ~/.chat_team/{config.yaml,roles,workspaces,logs,state}.
-python main.py
+python main.py                # background daemon (default)
+python main.py -f             # foreground — use this under systemd/supervisor or for debugging
+python main.py --stop         # stop the background daemon (SIGTERM, then SIGKILL after 10s)
+# Same -f / --stop flags work on the `chat-team` console script.
 
 # Smoke tests — all are pure Python, no LLM/network. Run individually.
 python scripts/smoke_dispatch.py                  # dispatcher + agent + tools (scripted LLM)
@@ -32,6 +38,7 @@ python scripts/smoke_split_llm.py                 # vision_llm vs chat_llm split
 python scripts/smoke_p0_round2.py                 # _bg_tasks strong-ref + concurrent get_or_create + eviction off event loop + finish-before-post_turn
 python scripts/smoke_mcp.py                       # MCP proxy tool + config parsing + agent integration
 python scripts/smoke_solo.py                      # solo mode: per-bot dispatchers + shared notebook + isolated persistence
+python scripts/smoke_private_chat_policy.py     # private_chat policy: open/closed/blacklist/whitelist + adapter gate + enter_chat
 
 # Conversational team-setup CLI (not the WeCom bot — see "Boss agent" below).
 chat-team-boss
@@ -61,7 +68,8 @@ All persistent state lives under `~/.chat_team/` (override with `CHAT_TEAM_HOME`
       notebook.index.json  # updated_at sidecar
       runs/<ts>.log        # full shell stdout (tool returns truncated)
       llm/<ts>-<seq>-<role>-<kind>.json  # per-LLM-call debug record (when llm.debug_log_enabled)
-  logs/                    # rotating chat_team.log
+  chat_team.pid            # PID of the background daemon (only in default background mode)
+  logs/                    # rotating chat_team.log + chat_team.out (daemon stdout/stderr)
   state/                   # cross-session bits (currently empty, reserved)
 ```
 
@@ -136,17 +144,84 @@ Key isolation points:
 
 **Tool sandbox.** `_resolve_under(cwd, rel)` rejects absolute paths and `..`, then double-checks via `os.path.realpath` + `os.path.commonpath`. `list_dir` hides anything starting with `.chat_team` so the LLM doesn't see internal metadata. `run_command` runs through `bash -c` with `cwd=ctx.cwd`, hard timeout from settings, output truncated to `shell_output_max_bytes` (full log to `.chat_team/runs/<ts>-<rand>.log` so the LLM can re-read via `read_file` if needed).
 
-**Team profile injection.** `~/.chat_team/team.md` is read once by `load_settings` into `settings.team_profile` (stripped); when non-empty, `Agent._build_system_messages` splices it as a `[团队信息]` block alongside the role prompt and meta lines. Empty/missing file → no block, behaviour unchanged. The compactor's `_summarize` uses its own sterile system prompt (`compactor.py:100-107`) and is intentionally NOT touched. No hot reload — edits to `team.md` only take effect on the next `chat-team` start.
+**Private chat policy.** `private_chat` in `config.yaml` controls whether the bot replies to 1:1 single chats. Group chats always pass through — only `chattype == "single"` is gated. Four modes: `open` (reply to everyone — the *old* pre-feature behaviour), `closed` (no one), `blacklist` (everyone except `blacklist`), `whitelist` (only `whitelist`). **The default is `whitelist` with an empty list (default-deny).** That means a brand-new install OR an upgrade that doesn't add a `private_chat` block will NOT reply to any private chat until the maintainer explicitly opts in via `mode: open` or by populating `whitelist`. **This is a breaking change on upgrade** — pre-feature deployments replied to every private chat. The maintainer recovers by either setting `mode: open` (back to old behaviour) or adding their own `from.userid` to `whitelist`. Group chats and the `chat-team-boss` CLI are unaffected (the boss runs locally and never goes through the adapter). Identifier is the WeCom `from.userid` (i.e. `IncomingMessage.user_id`) — NOT the member's name and NOT their phone number. End users can't see their own userid in the WeCom client, so the maintainer needs to obtain it first. Three ways: (1) **self-service via `blocked_reply`**: the reply template supports a `{userid}` placeholder that's substituted with the sender's userid — set `blocked_reply: "你的账号是 {userid}"`, a colleague sends one private chat, and learns the exact string to hand back. (2) **Log scrape**: the gate logs `private chat blocked: user=<userid> mode=whitelist` at INFO to `~/.chat_team/logs/chat_team.log`. (3) **WeCom admin console**: 通讯录 → member → 账号. `blocked_reply` with an unknown placeholder (e.g. `{foo}`) renders literally instead of raising so a config typo can't take the reply path down. Invalid `mode` values are normalised: the YAML loader lowercases first, and anything not in the four-value enum falls back to `whitelist` with a WARNING (fail-closed so a typo can't accidentally expose the bot; the maintainer just adds their userid once). `blocked_reply` (string) is sent as a single `aibot_respond_msg` text frame to a blocked user; empty string = silent drop. The gate lives in `WeComBotAdapter._handle_msg_callback` BEFORE the `思考中…` stream frame is queued (so a blocked user never sees the spinner) and also in `_handle_event_callback` for `enter_chat` welcomes in single chats. Blocked single chats never create a `Session`, never reach the dispatcher — the gate is at the adapter boundary. `PrivateChatConfig.allows(user_id)` is the single source of truth and is unit-tested in `scripts/smoke_private_chat_policy.py`.
+
+**Team profile injection.** `~/.chat_team/team.md` is read once by `load_settings` into `settings.team_profile` (stripped); when non-empty, `Agent._build_system_messages` splices it as a `[团队信息]` block alongside the role prompt and meta lines. Empty/missing file → no block, behaviour unchanged. The compactor's `_summarize` uses its own sterile system prompt (`compactor.py:100-107`) and is intentionally NOT touched. Hot-reloadable: `chat-team --reload` (or `kill -HUP <pid>`) re-reads `team.md` into `settings.team_profile` in place; the next turn's system-prompt rebuild picks it up without a restart. See "Hot reload" below.
 
 **LLM debug log.** Opt-in: set `llm.debug_log_enabled: true` in `~/.chat_team/config.yaml` (default off — one file per call piles up fast and transcripts can carry sensitive user content, so production must stay off). When on, every call into `OpenAIChatCompletionProvider.complete` writes a JSON file to `<workspace>/.chat_team/llm/<ts>-<seq>-<role>-<kind>.json`. The record carries the full request payload (messages + tools + model + temperature + max_tokens), the response (content + tool_calls + finish_reason + usage from `completion.usage.model_dump()`), and `latency_ms`. Three `call_kind` values: `agent` (main turn), `compactor` (post-turn summary), `vision` (eager OCR shim + `describe_image` tool). Failures write the same file with `error=repr(exc)` and `response=null` before re-raising. **Base64 image data URIs are redacted** to `[redacted: <mime> <bytes> bytes]` via `chat_team.llm.debug_logger.redact_messages` — files stay grep-able. Per-session monotonic `seq` (process-local dict keyed by `session_id`) keeps filenames sortable when the millisecond clock collides. The provider's `_maybe_write_log` reuses the exact `messages_payload` it built for OpenAI (no re-serialisation), so what you see in the log is what the API saw. Writes are best-effort: a write failure is logged at WARNING and the call still returns normally.
 
+## Hot reload (`chat-team --reload` / SIGHUP)
+
+Most config can be changed without dropping the WebSocket. Send SIGHUP to the
+daemon (`chat-team --reload`, or `kill -HUP $(cat ~/.chat_team/chat_team.pid)`)
+and the running process re-reads `config.yaml` + `team.md` + `roles/*.yaml` +
+`skills/*/` and applies the changes **in place** — no reconnect, no session
+loss. The result is logged to `~/.chat_team/logs/chat_team.log` as
+`hot reload result: ...`.
+
+**What is hot-reloadable** (mutated on the live `Settings` / registries,
+picked up on the next read):
+
+- `private_chat.*` — read on every inbound message; whitelist/blacklist/mode
+  changes take effect on the next message.
+- `session.*` (transfer cap, progress text/interval, debounce,
+  `max_in_memory_sessions`), `notebook.max_bytes`, `cleanup.*`,
+  `log_level` / `logging.*` — re-read on next use; logging is reconfigured
+  immediately (handlers cleared + re-added, no duplicate lines).
+- `llm.chat.{model,temperature,reasoning_effort,history_token_budget}`,
+  `llm.vision.{image_detail,strategy,model,oversized_image,resize_*,
+  max_inline_bytes}` — read per turn; the image-cache singleton is recreated
+  with the new resize knobs.
+- `llm.{debug_log_enabled,use_streaming,max_retries,retry_initial_delay}` —
+  pushed onto the live `OpenAIChatCompletionProvider` via
+  `apply_runtime_overrides` (chat + vision providers).
+- `team.md` (`team_profile`) — next turn's system-prompt rebuild picks it up.
+- `default_role` — affects new sessions only (existing sessions keep their role).
+- `roles/*.yaml` — `RoleRegistry.reload_in_place` atomically swaps the dict;
+  `transfer_to_employee`'s enum is refreshed; every live in-memory `Agent`'s
+  `role` attribute is swapped to the reloaded `Role` (history untouched). New
+  roles become transferable immediately; deleted roles leave existing agents
+  running with their frozen role until the session ends (counted as
+  `agents_role_orphaned`).
+- `skills/*/` — `SkillRegistry.reload_in_place` mirrors the above.
+
+**What requires a restart** (reported as `requires_restart`, NOT applied —
+these are bound to live OS resources that can't be swapped mid-flight):
+
+- `mode` (team↔solo), `bots[].{bot_id,secret}` (open WebSocket connections),
+  `workspace_root`, `mcp.servers` (subprocess/SSE lifecycle).
+- `llm.{api_key,base_url,request_timeout_seconds,http_debug_log_enabled}` —
+  baked into the constructed `AsyncOpenAI` + `httpx` client at startup; swap
+  them by editing `config.yaml` then `--stop && chat-team`.
+- `llm.vision.{api_key,base_url}` — same (vision provider is constructed once).
+
+**Trigger options.** `chat-team --reload` reads the pid file and sends SIGHUP.
+`kill -HUP <pid>` works directly. The SIGHUP handler is **non-cancelling**:
+unlike SIGTERM/SIGINT it does NOT touch the main task, so in-flight turns and
+the WebSocket are untouched. Concurrency is best-effort atomic at the
+attribute level (GIL): a turn in flight may see pre- or post-reload config
+for a single read but never corrupted state; we deliberately do not acquire
+every session lock (hundreds) for a reload.
+
+**Bad YAML is safe.** If `config.yaml` fails to parse, `reload_settings`
+populates `report.errors`, mutates nothing, and logs `reload FAILED` — the
+running process keeps its previous config. Fix the YAML and `--reload` again.
+
+**Key files:** `config.py` (`reload_settings`, `ReloadReport`),
+`roles/registry.py` + `skills/registry.py` (`reload_in_place`),
+`agent/tools/transfer_tool.py` (`update_employees`),
+`llm/openai_provider.py` (`apply_runtime_overrides`),
+`reload.py` (`Reloader` orchestrator + `CombinedReloadReport`),
+`app.py` (SIGHUP wiring in `_run_with_shutdown` + `--reload` CLI),
+`daemon.py` (`reload_daemon`), `scripts/smoke_reload.py` (coverage).
+
 ## Adding a role / tool
 
-**Role** — drop a YAML in `src/chat_team/roles/builtin/` (committed) or `~/.chat_team/roles/` (user override, takes precedence). Required fields: `name`, `system_prompt`, `tools` (a subset of registered tool names). Optional: `display_name`, `welcome_message` (used for `enter_chat`), `llm.{model,temperature,history_token_budget,image_detail,vision_strategy}`, `mcp_servers` (list of MCP server names from `config.yaml`). `vision_strategy: tool|direct` overrides the global default — set `direct` on a role that needs raw images in context (e.g. art critique). No code changes needed — `RoleRegistry.load` picks it up and `transfer_to_employee`'s enum is rebuilt from `roles.names()`.
+**Role** — drop a YAML in `src/chat_team/roles/builtin/` (committed) or `~/.chat_team/roles/` (user override, takes precedence). Required fields: `name`, `system_prompt`, `tools` (a subset of registered tool names). Optional: `display_name`, `welcome_message` (used for `enter_chat`), `llm.{model,temperature,history_token_budget,image_detail,vision_strategy}`, `mcp_servers` (list of MCP server names from `config.yaml`). `vision_strategy: tool|direct` overrides the global default — set `direct` on a role that needs raw images in context (e.g. art critique). No code changes needed — `RoleRegistry.load` picks it up and `transfer_to_employee`'s enum is rebuilt from `roles.names()`. Hot-reloadable: `chat-team --reload` re-scans `roles/`, atomically swaps `RoleRegistry`'s internal dict, refreshes the `transfer_to_employee` enum, and swaps `agent.role` on every live in-memory agent (history preserved) so the next turn's prompt rebuild picks up new prompts/tools. Deleted roles: running agents keep their frozen role until the session ends (counted as `agents_role_orphaned`). See "Hot reload" below.
 
 **Tool** — subclass `Tool` (`src/chat_team/agent/tools/base.py`), set `name`/`description`/`parameters` (JSON schema), implement `async run(ctx, **kwargs)`. Register in `app.build_tool_registry`. Reference it in role YAMLs that should expose it. Raise `ToolError` for recoverable failures (returned to the LLM as a tool message); raise `TransferRequested` only if you're implementing role-switch semantics. If your tool needs to call the LLM (e.g. vision/embedding), read `ctx.llm` — `ToolContext.llm` is wired to `agent.llm` so the tool reuses the same provider configuration.
 
-**Skill** — a no-code capability pack: drop a directory at `~/.chat_team/skills/<name>/` containing `SKILL.md` (YAML frontmatter + markdown body) plus optional auxiliary files. Frontmatter must have `name` (must equal the directory name) and `description` (single line preferred — multi-line works but only the first line lands in the system-prompt TOC). Body is whatever instructions you want the agent to follow when invoked. To expose a skill to a role, list it under `skills:` in the role YAML AND include `skill` (and optionally `skill_read_file`) in `tools:`. The agent sees a `[可用 skills] - name: description` block in its system prompt, fetches the body via `skill(name=...)`, and reads aux files via `skill_read_file(skill=..., path=...)`. `SkillRegistry.load` mirrors `RoleRegistry.load`: builtin (`src/chat_team/skills/builtin/`) first, user dir overrides by name. Malformed skills (missing/invalid frontmatter, name/dir mismatch, missing SKILL.md) are logged at WARNING and skipped — one bad dir won't break the rest. Per-role gating happens twice: once when rendering the TOC (filtered to `role.skills ∩ registry.names()`) and again at tool invocation in `SkillTool.run`. The `enum` on the JSON-schema parameters is the full registry (one tool instance for all roles), so the runtime check is the real gate. No hot reload — restart `chat-team` after adding/editing skills.
+**Skill** — a no-code capability pack: drop a directory at `~/.chat_team/skills/<name>/` containing `SKILL.md` (YAML frontmatter + markdown body) plus optional auxiliary files. Frontmatter must have `name` (must equal the directory name) and `description` (single line preferred — multi-line works but only the first line lands in the system-prompt TOC). Body is whatever instructions you want the agent to follow when invoked. To expose a skill to a role, list it under `skills:` in the role YAML AND include `skill` (and optionally `skill_read_file`) in `tools:`. The agent sees a `[可用 skills] - name: description` block in its system prompt, fetches the body via `skill(name=...)`, and reads aux files via `skill_read_file(skill=..., path=...)`. `SkillRegistry.load` mirrors `RoleRegistry.load`: builtin (`src/chat_team/skills/builtin/`) first, user dir overrides by name. Malformed skills (missing/invalid frontmatter, name/dir mismatch, missing SKILL.md) are logged at WARNING and skipped — one bad dir won't break the rest. Per-role gating happens twice: once when rendering the TOC (filtered to `role.skills ∩ registry.names()`) and again at tool invocation in `SkillTool.run`. The `enum` on the JSON-schema parameters is the full registry (one tool instance for all roles), so the runtime check is the real gate. Hot-reloadable via `chat-team --reload` (SIGHUP) — `SkillRegistry.reload_in_place` atomically swaps the internal dict, so existing `SkillTool`/`SkillReadFileTool` references see new/changed skills on the next call. See "Hot reload" below.
 
 **Python deps for skills (uv + PEP 723).** SKILL.md format is deliberately kept 100% compatible with community skills (frontmatter only carries `name` + `description`), so per-skill dependency declarations are out of scope. Instead: when a role's `tools` contains **both** `skill` and `run_command`, `Agent._build_system_messages` splices in the `PYTHON_UV_CONVENTION` block (`agent/agent.py`) — it tells the agent to write Python scripts with PEP 723 inline metadata (`# /// script\n# dependencies = [...]\n# ///`) and run them via `uv run script.py`. `uv` resolves deps into its global content-addressed env cache (`~/.cache/uv/environments-v2/<hash>/`), shared across sessions/roles/workspaces with zero per-workspace state. `app.warn_if_uv_missing` logs a WARNING on startup if any loaded role would need `uv` but it isn't on PATH; the bot still runs (non-Python skills unaffected). Why not per-workspace venv: 100 sessions × 100MB site-packages is wasteful in a multi-tenant bot. Why not `pip_install` tool: reactive install-on-import-fail costs a full LLM turn per missed dep.
 
@@ -189,7 +264,7 @@ mcp_servers: [filesystem, github]        # 该角色可使用这两个 MCP 服�
 
 **关键文件：** `src/chat_team/mcp/config.py`（配置 dataclass）、`src/chat_team/mcp/client.py`（`McpClientManager` 生命周期）、`src/chat_team/mcp/proxy_tool.py`（`McpProxyTool(Tool)` 桥接）。
 
-**限制。** 当前只支持 MCP Tools，不支持 Resources / Prompts。不支持热加载——修改 MCP 配置需重启 bot。`chat-team-tools` CLI 不列出 MCP 工具（它们是运行时动态发现的）。
+**限制。** 当前只支持 MCP Tools，不支持 Resources / Prompts。不支持热加载——修改 MCP 配置需重启 bot（MCP 子进程/SSE 连接的 lifecycle 不能在运行中安全替换；`chat-team --reload` 会把 `mcp.servers` 的变更报为 `requires_restart` 而非应用）。`chat-team-tools` CLI 不列出 MCP 工具（它们是运行时动态发现的）。
 
 ## Solo mode (一 bot 一角色)
 

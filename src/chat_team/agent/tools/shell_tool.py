@@ -88,6 +88,15 @@ async def _terminate_process_group(proc: asyncio.subprocess.Process) -> bytes:
 
 class RunCommandTool(Tool):
     name = "run_command"
+
+    def __init__(self, skills=None, roles=None):
+        # Optional reference to the SkillRegistry / RoleRegistry so that
+        # run() can enforce trigger-keyword gates when the LLM tries to
+        # bypass the protected ``skill()`` tool by directly executing a
+        # skill's scripts via shell. Default None = no gate (used by smokes
+        # that don't care about skills).
+        self._skills = skills
+        self._roles = roles
     description = (
         "在当前会话的工作目录中执行一条 shell 命令(bash -c)。受超时与输出大小上限保护。"
         "输出会截断回显;完整 stdout/stderr 落到 .chat_team/runs/<ts>.log,可通过 read_file 取回。"
@@ -108,6 +117,16 @@ class RunCommandTool(Tool):
         command = kwargs.get("command", "")
         if not isinstance(command, str) or not command.strip():
             raise ToolError("command must be a non-empty string")
+
+        # Trigger-keyword gate: refuse to run any command that references a
+        # protected skill's directory unless the user said a trigger keyword.
+        # Closes the bypass where the LLM avoids skill(name=...) and shells
+        # out to the skill scripts directly.
+        if self._skills is not None:
+            # Local import avoids a hard dep cycle (skill_tools imports base).
+            from .skill_tools import scan_command_for_protected_skills
+            scan_command_for_protected_skills(command, self._skills, ctx)
+
         timeout = kwargs.get("timeout") or ctx.settings.tools.shell_timeout_seconds
         try:
             timeout = int(timeout)

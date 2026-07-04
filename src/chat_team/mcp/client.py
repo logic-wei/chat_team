@@ -1,6 +1,7 @@
 """McpClientManager — manages MCP server connections and exposes proxy tools."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -9,6 +10,14 @@ from .config import McpServerConfig
 from .proxy_tool import McpProxyTool
 
 log = logging.getLogger(__name__)
+
+# Hard cap on each async-context-manager __aexit__ during shutdown. The
+# MCP stdio transport's anyio task group waits on a reader task that can
+# hang (or its cancel scope can get into an inconsistent state under
+# cancellation), which would otherwise block --stop / SIGTERM forever.
+# Abandoning the Python-side close is safe: when this process exits, the
+# stdio pipe to the child MCP server closes and the child exits on EOF.
+_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass
@@ -101,20 +110,43 @@ class McpClientManager:
 
     async def close_all(self) -> None:
         for handle in reversed(self._handles):
-            try:
-                if handle.session_cm is not None:
-                    await handle.session_cm.__aexit__(None, None, None)
-            except Exception:
-                log.debug(
-                    "error closing MCP session for %r", handle.config.name,
-                    exc_info=True,
-                )
-            try:
-                if handle.transport_cm is not None:
-                    await handle.transport_cm.__aexit__(None, None, None)
-            except Exception:
-                log.debug(
-                    "error closing MCP transport for %r", handle.config.name,
-                    exc_info=True,
-                )
+            await self._close_cm("session", handle.config.name, handle.session_cm)
+            await self._close_cm(
+                "transport", handle.config.name, handle.transport_cm,
+            )
         self._handles.clear()
+
+    async def _close_cm(
+        self, kind: str, server_name: str, cm: Any,
+    ) -> None:
+        """Close one async CM with a hard timeout.
+
+        Uses ``asyncio.wait`` (not ``wait_for``) so the abandoned task is NOT
+        cancelled — anyio's cancel scope may already be in an inconsistent
+        state, and cancelling it again can re-raise the cross-task
+        ``RuntimeError`` we are trying to dodge. A pending task left here is
+        harmless: it (or its child process) gets cleaned up when the loop
+        closes and the stdio pipe goes away.
+        """
+        if cm is None:
+            return
+        task = asyncio.ensure_future(cm.__aexit__(None, None, None))
+        done, _pending = await asyncio.wait(
+            {task}, timeout=_CLOSE_TIMEOUT_SECONDS,
+        )
+        if task in done:
+            exc = task.exception()
+            if exc is not None:
+                # anyio may surface BaseExceptionGroup here; debug-level so it
+                # doesn't spam on every clean shutdown.
+                log.debug(
+                    "MCP %s close for %r raised: %r",
+                    kind, server_name, exc,
+                )
+        else:
+            log.warning(
+                "MCP %s close for %r timed out after %.0fs; abandoning "
+                "(child MCP server exits when its stdio pipe closes on "
+                "process exit)",
+                kind, server_name, _CLOSE_TIMEOUT_SECONDS,
+            )
