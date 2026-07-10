@@ -65,10 +65,28 @@ class CleanupConfig:
 
 
 @dataclass
+class KeyRotationConfig:
+    """Multi-API-key rotation settings (see ``llm/api_keys``).
+
+    When ``llm.api_keys`` has more than one entry, the OpenAI provider binds
+    each ``(session_id, role_name)`` pair to a single key (round-robin) and
+    reuses it for the life of that binding so the upstream prefix-cache stays
+    warm. A binding is released after ``idle_reset_seconds`` with no activity;
+    the next request for that pair advances the round-robin pointer (it does
+    *not* re-pick the just-released key). Rotation is in-memory only — not
+    persisted, not hot-reloadable (keys are baked into constructed clients).
+    """
+    enabled: bool = True
+    idle_reset_seconds: float = 600.0
+
+
+@dataclass
 class LLMConfig:
     provider: str = "openai"
     api_key: str = ""
+    api_keys: list[str] = field(default_factory=list)
     base_url: str = ""
+    key_rotation: "KeyRotationConfig" = field(default_factory=lambda: KeyRotationConfig())
     chat: "LLMChatConfig" = field(default_factory=lambda: LLMChatConfig())
     vision: "LLMVisionConfig" = field(default_factory=lambda: LLMVisionConfig())
     debug_log_enabled: bool = False
@@ -97,6 +115,7 @@ class LLMVisionConfig:
     image_detail: str = "high"
     reasoning_effort: str = ""
     api_key: str = ""
+    api_keys: list[str] = field(default_factory=list)
     base_url: str = ""
     # Image size limits and resize behaviour for vision payloads.
     # When a raw image exceeds max_inline_bytes:
@@ -239,7 +258,7 @@ _REQUIRES_RESTART_TOP = frozenset({"mode", "bots", "workspace_root", "mcp"})
 # client. The provider's ``apply_runtime_overrides`` covers the *other* llm
 # knobs; these stay restart-only.
 _LLM_REQUIRES_RESTART = frozenset({
-    "api_key", "base_url",
+    "api_key", "api_keys", "base_url", "key_rotation",
     "request_timeout_seconds", "http_debug_log_enabled",
 })
 
@@ -247,7 +266,7 @@ _LLM_REQUIRES_RESTART = frozenset({
 # ``ImageDataURICache`` singleton baked in at startup. ``configure_default_cache``
 # is re-invoked on reload for the *other* vision cache knobs, but api_key /
 # base_url feed the vision provider construction.
-_VISION_REQUIRES_RESTART = frozenset({"api_key", "base_url"})
+_VISION_REQUIRES_RESTART = frozenset({"api_key", "api_keys", "base_url"})
 
 
 @dataclass
@@ -380,12 +399,14 @@ def _build_settings_from_raw(raw: dict[str, Any], paths: Paths) -> Settings:
         llm_raw = raw["llm"]
         assert isinstance(llm_raw, dict)
         _coerce(settings.llm, {
-            k: v for k, v in llm_raw.items() if k not in {"chat", "vision"}
+            k: v for k, v in llm_raw.items() if k not in {"chat", "vision", "key_rotation"}
         })
         if isinstance(llm_raw.get("chat"), dict):
             _coerce(settings.llm.chat, llm_raw["chat"])
         if isinstance(llm_raw.get("vision"), dict):
             _coerce(settings.llm.vision, llm_raw["vision"])
+        if isinstance(llm_raw.get("key_rotation"), dict):
+            _coerce(settings.llm.key_rotation, llm_raw["key_rotation"])
     if isinstance(raw.get("logging"), dict):
         _coerce(settings.logging, raw["logging"])
     if isinstance(raw.get("cleanup"), dict):

@@ -33,6 +33,7 @@ from .base import (
     ToolCall,
 )
 from .image_cache import ImageDataURICache, default_cache
+from .key_rotation import SessionKeyRouter
 
 log = logging.getLogger(__name__)
 
@@ -210,6 +211,9 @@ class OpenAIChatCompletionProvider(LLMProvider):
         api_key: str,
         base_url: str | None = None,
         *,
+        api_keys: list[str] | None = None,
+        key_rotation_enabled: bool = True,
+        key_rotation_idle_seconds: float = 600.0,
         debug_log_enabled: bool = False,
         http_debug_log_enabled: bool = False,
         request_timeout_seconds: float = 60.0,
@@ -217,6 +221,18 @@ class OpenAIChatCompletionProvider(LLMProvider):
         retry_initial_delay: float = 1.0,
         use_streaming: bool = True,
     ):
+        # Build the effective key list. ``api_keys`` (plural) takes priority
+        # when non-empty; otherwise fall back to the single ``api_key`` for
+        # full backward compatibility.
+        keys: list[str] = [k for k in (api_keys or []) if k]
+        if not keys:
+            keys = [api_key]
+        if not keys[0]:
+            raise ValueError(
+                "OpenAIChatCompletionProvider requires at least one api_key "
+                "(pass api_key=... or api_keys=[...])"
+            )
+        self._keys = keys
         self._http_debug_log_enabled = http_debug_log_enabled
         event_hooks: dict[str, list[Any]] | None = None
         if http_debug_log_enabled:
@@ -224,22 +240,38 @@ class OpenAIChatCompletionProvider(LLMProvider):
                 "request": [self._on_http_request],
                 "response": [self._on_http_response],
             }
-        http_client = httpx.AsyncClient(
+        # One shared httpx connection pool for all keys — N AsyncOpenAI
+        # clients reuse it so we don't multiply connection counts by N.
+        # max_retries=0 disables the SDK's own retry layer so our outer loop
+        # (which now also iterates keys on failure) is the single source of
+        # truth for retry policy.
+        self._http_client = httpx.AsyncClient(
             timeout=request_timeout_seconds,
             event_hooks=event_hooks,
         )
-        # Pass timeout into the SDK client so a hung request can't hold the
-        # session lock indefinitely (the dispatcher holds it for the whole turn).
-        # max_retries=0 disables the SDK's own retry layer so our outer loop
-        # is the single source of truth for retry policy.
-        self._client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url or None,
-            http_client=http_client,
-            default_headers={"User-Agent": _OPENCODE_USER_AGENT},
-            timeout=request_timeout_seconds,
-            max_retries=0,
-        )
+        self._clients: list[AsyncOpenAI] = [
+            AsyncOpenAI(
+                api_key=k,
+                base_url=base_url or None,
+                http_client=self._http_client,
+                default_headers={"User-Agent": _OPENCODE_USER_AGENT},
+                timeout=request_timeout_seconds,
+                max_retries=0,
+            )
+            for k in keys
+        ]
+        # ``self._client`` kept as the index-0 client for any legacy/test
+        # code path that reads it directly (monkey-patched create() etc.).
+        self._client = self._clients[0]
+        # Round-robin binder is only active when there is >1 key AND the
+        # maintainer hasn't disabled it. With a single key everything goes
+        # to index 0 and there's zero per-call overhead.
+        if len(keys) > 1 and key_rotation_enabled:
+            self._router: SessionKeyRouter | None = SessionKeyRouter(
+                len(keys), idle_reset_seconds=key_rotation_idle_seconds,
+            )
+        else:
+            self._router = None
         self._debug_log_enabled = debug_log_enabled
         self._max_retries = max(1, int(max_retries))
         self._retry_initial_delay = max(0.0, float(retry_initial_delay))
@@ -305,10 +337,13 @@ class OpenAIChatCompletionProvider(LLMProvider):
         self,
         kwargs: dict[str, Any],
         stream_text_callback=None,
+        *,
+        client: AsyncOpenAI | None = None,
     ) -> tuple[ChatMessage, str, dict[str, Any] | None, Any | None]:
         # Some tests monkey-patch create() with a non-stream fake object. If
         # the returned value is not async-iterable, treat it as non-stream.
-        maybe_stream = await self._client.chat.completions.create(**kwargs, stream=True)
+        c = client or self._client
+        maybe_stream = await c.chat.completions.create(**kwargs, stream=True)
         if not hasattr(maybe_stream, "__aiter__"):
             completion = maybe_stream
             choice = completion.choices[0]
@@ -431,31 +466,77 @@ class OpenAIChatCompletionProvider(LLMProvider):
         usage: dict[str, Any] | None = None
         raw_obj: Any | None = None
         last_exc: Exception | None = None
+        # ---- per-(session,role) key binding + multi-key retry ----
+        # On failure we don't disable keys (maintainer's rule): we try the
+        # bound key first, then every other key in round-robin order, each
+        # retried up to ``max_retries`` times. The binding itself never
+        # moves on failure — only idle-reset advances it — so the next
+        # turn for this ``(session, role)`` reuses the same bound key
+        # (cache-friendly) unless it has since gone idle.
+        bound_idx = (
+            self._router.select(request.session_id, request.role_name)
+            if self._router is not None else 0
+        )
+        n_clients = len(self._clients)
+        key_order = [(bound_idx + i) % n_clients for i in range(n_clients)]
+        succeeded = False
         try:
-            for attempt in range(self._max_retries):
-                attempts = attempt + 1
-                try:
-                    if self._use_streaming:
-                        response_msg, finish_reason, usage, raw_obj = await self._complete_with_streaming(
-                            kwargs,
-                            stream_text_callback=request.stream_text_callback,
-                        )
-                    else:
-                        completion = await self._client.chat.completions.create(**kwargs)
-                    break
-                except _RETRYABLE_EXCEPTIONS as exc:
-                    last_exc = exc
-                    if attempt >= self._max_retries - 1:
+            for key_idx in key_order:
+                client = self._clients[key_idx]
+                key_attempts = 0
+                for attempt in range(self._max_retries):
+                    attempts += 1
+                    key_attempts += 1
+                    try:
+                        if self._use_streaming:
+                            response_msg, finish_reason, usage, raw_obj = (
+                                await self._complete_with_streaming(
+                                    kwargs,
+                                    stream_text_callback=request.stream_text_callback,
+                                    client=client,
+                                )
+                            )
+                        else:
+                            completion = await client.chat.completions.create(**kwargs)
+                        succeeded = True
+                        last_exc = None
                         break
-                    delay = self._retry_initial_delay * (2 ** attempt) + random.uniform(0, 0.5)
-                    log.warning(
-                        "LLM call failed (%s) on attempt %d/%d; retrying in %.2fs",
-                        type(exc).__name__, attempts, self._max_retries, delay,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                except Exception as exc:                              # noqa: BLE001
-                    last_exc = exc
+                    except _RETRYABLE_EXCEPTIONS as exc:
+                        last_exc = exc
+                        if attempt >= self._max_retries - 1:
+                            # this key's retry budget is spent — fall
+                            # through to the next key (if any).
+                            if key_idx != key_order[-1]:
+                                log.warning(
+                                    "LLM call failed on key %d (%s) after "
+                                    "%d/%d attempts; trying next key",
+                                    key_idx, type(exc).__name__,
+                                    key_attempts, self._max_retries,
+                                )
+                            break
+                        delay = self._retry_initial_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                        log.warning(
+                            "LLM call failed on key %d (%s) attempt %d/%d; "
+                            "retrying in %.2fs",
+                            key_idx, type(exc).__name__,
+                            key_attempts, self._max_retries, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    except Exception as exc:                          # noqa: BLE001
+                        # Non-retryable (401/403/etc): don't keep hammering
+                        # this key — jump to the next one. We never mark a
+                        # key permanently bad (maintainer's "don't disable"
+                        # rule); it stays eligible for future bindings.
+                        last_exc = exc
+                        if key_idx != key_order[-1]:
+                            log.warning(
+                                "LLM call hit non-retryable error on key %d "
+                                "(%s); trying next key",
+                                key_idx, type(exc).__name__,
+                            )
+                        break
+                if succeeded:
                     break
         finally:
             if token is not None:

@@ -39,6 +39,7 @@ python scripts/smoke_p0_round2.py                 # _bg_tasks strong-ref + concu
 python scripts/smoke_mcp.py                       # MCP proxy tool + config parsing + agent integration
 python scripts/smoke_solo.py                      # solo mode: per-bot dispatchers + shared notebook + isolated persistence
 python scripts/smoke_private_chat_policy.py     # private_chat policy: open/closed/blacklist/whitelist + adapter gate + enter_chat
+python scripts/smoke_key_rotation.py            # llm.api_keys round-robin: (session,role) binding + idle reset + multi-key retry + single-key compat
 
 # Conversational team-setup CLI (not the WeCom bot — see "Boss agent" below).
 chat-team-boss
@@ -132,6 +133,12 @@ Key isolation points:
 
 **Split vision / chat providers.** 视觉/OCR 调用可以走独立的 API 端点。凭证在 `config.yaml` 的 `llm.vision.api_key` / `llm.vision.base_url` 配置，留空则回落至 `llm.api_key` / `llm.base_url`；也可通过 `OPENAI_VISION_API_KEY` / `OPENAI_VISION_BASE_URL` 环境变量设置（config.yaml 优先）。`llm.vision.model` 指定视觉模型名称（留空则复用 `llm.chat.model`）。当凭证与主模型相同时复用同一 `LLMProvider` 实例（不多开连接）。`app.build_vision_llm_provider` 处理此逻辑；`Dispatcher` 持有 `self._vision_llm` 并传给急切 OCR shim（`apply_vision_strategy`）和 `Agent` 构造（`describe_image` 工具经 `ToolContext.vision_llm` 使用）。Compactor 始终用聊天模型。
 
+**Multi-API-key rotation (prefix-cache friendly).** `llm.api_keys: [sk-a, sk-b, ...]` (and `llm.vision.api_keys` for the vision provider) lets a single process rotate across N API keys. The unit of binding is `(session_id, role_name)` — *not* the workspace: different roles in the same session get **different** keys (their histories are isolated, so there's no shared prefix cache to lose). On the first request for a pair the round-robin pointer advances (`SessionKeyRouter`, `llm/key_rotation.py`) and that key is reused for every subsequent turn of the same pair so the upstream prefix cache stays warm. A binding is released after `llm.key_rotation.idle_reset_seconds` (default 600s, **10 min**) of no activity; the next request for that pair **continues the rotation** (advances the pointer — it does NOT re-pick the just-released key). Bindings are **in-memory only**: not persisted across restart, not hot-reloadable (`api_keys` / `key_rotation` are `requires_restart`, baked into constructed `AsyncOpenAI` clients at startup).
+
+  **Failure handling — try every key, never disable.** On a failed call the provider iterates the bound key first, then every other key in round-robin order, each retried up to `llm.max_retries` (default 3) times → up to N×3 attempts before the last exception bubbles. Retryable errors (`APITimeoutError` / `APIConnectionError` / `RateLimitError` / `InternalServerError`) are retried with backoff on the *same* key first; non-retryable errors (401/403/etc) jump to the next key immediately (no 3× hammer). **No key is ever permanently disabled** — a key that fails stays eligible for future bindings. The binding itself never moves on failure: even if the call succeeds on a *different* key, the next turn for that `(session, role)` reuses the original bound key (unless it has since gone idle). This matches the maintainer's rule: "once bound, always this key; only idle reset advances; failures never permanently disable."
+
+  **Vision shares the router.** When vision credentials are identical to the main provider's, `build_vision_llm_provider` returns `main_llm` itself — sharing not just the httpx connection pool but also the `SessionKeyRouter`, so eager OCR / `describe_image` calls reuse the same key the chat turns are using. Separate vision keys (`llm.vision.api_keys`) get their own router. All call paths already pass `session_id` + `role_name` on `CompletionRequest`, so the agent/compactor/vision-shim/describe-image all route through the same binding with zero call-site changes. Single-key installs (no `api_keys`, just `api_key`) get one client and `router=None` — identical behaviour to before, full backward compat.
+
 **Image description cache.** `chat_team.llm.image_description_cache.ImageDescriptionCache` is a process-level LRU keyed by `(abs_path, mtime_ns, size, detail, model, prompt)` → description text. Caps: `MAX_ENTRIES=128`, `MAX_TOTAL_BYTES≈1MB`. Module-level singleton via `default_cache()`; same image with same prompt+detail+model is OCR'd exactly once across roles, sessions, and turns within a process. Different prompt or different file mtime/size invalidates. The cache is shared by both the eager shim AND the `describe_image` tool, so an agent re-querying with a custom prompt only pays for prompts not already cached.
 
 **Image base64 cache.** `chat_team.llm.image_cache.ImageDataURICache` is a module-level LRU keyed by `(abs_path, mtime_ns, size, resize_long_side, resize_quality)` → `data:image/<mime>;base64,...`. Caps: `MAX_ENTRIES=32`, `MAX_TOTAL_BYTES≈32MB`. Per-image `max_inline_bytes` defaults to 6MB (raw — base64 ≈ 8MB, leaves headroom under OpenAI's ~10MB request limit); configurable via `config.yaml` `llm.vision.max_inline_bytes`. Missing file → `None`. Oversize behaviour depends on `llm.vision.oversized_image`: `"resize"` (default) auto-downscales the image so the longest dimension ≤ `resize_long_side` pixels (default 2048) and re-encodes as JPEG at `resize_quality` (default 85), then serves the resized data URI; `"reject"` returns `None` (text placeholder). Pillow is required for resize; without it, oversized images degrade to placeholders with a WARNING. RGBA images are composited onto white before JPEG re-encoding. The provider degrades missing/unrecoverable files to `[图:<name>(已丢失)]` / `(过大,已省略)` text blocks so a single bad image doesn't fail the whole turn. MIME map reuses `wecom_media.sniff_extension` (jpg/png/gif/webp; everything else → image/jpeg). `configure_default_cache()` in `app.py` wires the cache singleton to settings at startup.
@@ -190,10 +197,10 @@ these are bound to live OS resources that can't be swapped mid-flight):
 
 - `mode` (team↔solo), `bots[].{bot_id,secret}` (open WebSocket connections),
   `workspace_root`, `mcp.servers` (subprocess/SSE lifecycle).
-- `llm.{api_key,base_url,request_timeout_seconds,http_debug_log_enabled}` —
+- `llm.{api_key,api_keys,base_url,key_rotation,request_timeout_seconds,http_debug_log_enabled}` —
   baked into the constructed `AsyncOpenAI` + `httpx` client at startup; swap
   them by editing `config.yaml` then `--stop && chat-team`.
-- `llm.vision.{api_key,base_url}` — same (vision provider is constructed once).
+- `llm.vision.{api_key,api_keys,base_url}` — same (vision provider is constructed once).
 
 **Trigger options.** `chat-team --reload` reads the pid file and sends SIGHUP.
 `kill -HUP <pid>` works directly. The SIGHUP handler is **non-cancelling**:

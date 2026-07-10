@@ -77,19 +77,33 @@ def build_tool_registry(
     return reg
 
 
+def _resolve_main_keys(settings: Settings) -> list[str]:
+    """Resolved, de-duplicated-empty main key list (llm.api_keys wins)."""
+    keys = [k for k in (settings.llm.api_keys or []) if k]
+    if not keys:
+        single = settings.llm.api_key or os.environ.get("OPENAI_API_KEY", "")
+        keys = [single] if single else []
+    return keys
+
+
 def build_llm_provider(settings: Settings) -> LLMProvider:
     if settings.llm.provider != "openai":
         raise NotImplementedError(f"llm provider not supported yet: {settings.llm.provider}")
-    api_key = settings.llm.api_key or os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
+    api_keys = _resolve_main_keys(settings)
+    if not api_keys:
         raise RuntimeError(
-            "LLM API key missing — set llm.api_key in ~/.chat_team/config.yaml "
-            "or the OPENAI_API_KEY environment variable"
+            "LLM API key missing — set llm.api_key or llm.api_keys in "
+            "~/.chat_team/config.yaml or the OPENAI_API_KEY environment variable"
         )
+    api_key = api_keys[0]
     base_url = settings.llm.base_url or os.environ.get("OPENAI_BASE_URL") or None
+    kr = settings.llm.key_rotation
     return OpenAIChatCompletionProvider(
         api_key=api_key,
+        api_keys=api_keys,
         base_url=base_url,
+        key_rotation_enabled=kr.enabled,
+        key_rotation_idle_seconds=kr.idle_reset_seconds,
         debug_log_enabled=settings.llm.debug_log_enabled,
         http_debug_log_enabled=settings.llm.http_debug_log_enabled,
         use_streaming=settings.llm.use_streaming,
@@ -102,40 +116,59 @@ def build_llm_provider(settings: Settings) -> LLMProvider:
 def build_vision_llm_provider(settings: Settings, main_llm: LLMProvider) -> LLMProvider:
     """Return an LLM provider for vision/OCR calls.
 
-    Credentials are read exclusively from environment variables, consistent
-    with how the main provider reads OPENAI_API_KEY / OPENAI_BASE_URL from .env:
-
-      OPENAI_VISION_API_KEY  — vision API key; falls back to OPENAI_API_KEY
-      OPENAI_VISION_BASE_URL — vision base URL; falls back to OPENAI_BASE_URL
-
-    When the resolved vision credentials are identical to the main provider's,
-    ``main_llm`` is returned as-is to avoid duplicate connections.
+    Credential resolution mirrors the main provider: ``llm.vision.api_keys``
+    (plural) wins when non-empty, otherwise ``llm.vision.api_key`` /
+    ``OPENAI_VISION_API_KEY`` fall back to the *main* key list. When the
+    resolved vision key list + base_url are identical to the main
+    provider's, ``main_llm`` is returned as-is — this shares not only the
+    httpx connection pool but also the per-``(session, role)`` key router,
+    so vision OCR calls reuse the same key the chat turns are using.
     """
-    main_api_key = settings.llm.api_key or os.environ.get("OPENAI_API_KEY", "")
+    main_api_keys = _resolve_main_keys(settings)
     main_base_url = settings.llm.base_url or os.environ.get("OPENAI_BASE_URL") or None
 
-    vision_api_key = (
-        settings.llm.vision.api_key
-        or os.environ.get("OPENAI_VISION_API_KEY", "")
-        or main_api_key
-    )
+    vision_api_keys = [k for k in (settings.llm.vision.api_keys or []) if k]
+    if not vision_api_keys:
+        vision_single = (
+            settings.llm.vision.api_key
+            or os.environ.get("OPENAI_VISION_API_KEY", "")
+        )
+        if vision_single:
+            vision_api_keys = [vision_single]
+        else:
+            vision_api_keys = list(main_api_keys)
     vision_base_url = (
         settings.llm.vision.base_url
         or os.environ.get("OPENAI_VISION_BASE_URL", "")
         or main_base_url
     ) or None
 
-    # Reuse the main provider when credentials are identical — no extra connections.
-    if vision_api_key == main_api_key and vision_base_url == main_base_url:
+    # Reuse the main provider when the resolved key list + base_url are
+    # identical — shares the connection pool AND the session→key router.
+    if vision_api_keys == main_api_keys and vision_base_url == main_base_url:
         return main_llm
 
+    if not vision_api_keys:
+        # Defensive: main had no keys either (build_llm_provider would have
+        # already raised, but be safe for direct callers in tests).
+        raise RuntimeError(
+            "vision LLM API key missing — set llm.vision.api_key or "
+            "llm.vision.api_keys, or OPENAI_VISION_API_KEY"
+        )
+
     log.info(
-        "vision LLM uses separate credentials (base_url=%s)",
+        "vision LLM uses separate credentials (base_url=%s, keys=%d)",
         vision_base_url or "(default)",
+        len(vision_api_keys),
     )
+    vision_api_key = vision_api_keys[0]
+    kr = settings.llm.key_rotation
     return OpenAIChatCompletionProvider(
         api_key=vision_api_key,
+        api_keys=vision_api_keys,
         base_url=vision_base_url,
+        key_rotation_enabled=kr.enabled,
+        key_rotation_idle_seconds=kr.idle_reset_seconds,
         debug_log_enabled=settings.llm.debug_log_enabled,
         http_debug_log_enabled=settings.llm.http_debug_log_enabled,
         use_streaming=settings.llm.use_streaming,
