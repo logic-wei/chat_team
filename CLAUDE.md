@@ -40,6 +40,7 @@ python scripts/smoke_mcp.py                       # MCP proxy tool + config pars
 python scripts/smoke_solo.py                      # solo mode: per-bot dispatchers + shared notebook + isolated persistence
 python scripts/smoke_private_chat_policy.py     # private_chat policy: open/closed/blacklist/whitelist + adapter gate + enter_chat
 python scripts/smoke_key_rotation.py            # llm.api_keys round-robin: (session,role) binding + idle reset + multi-key retry + single-key compat
+python scripts/smoke_slash_commands.py            # /new /stop /status (group+private) + /running (private-only) + history rollback on /stop
 
 # Conversational team-setup CLI (not the WeCom bot — see "Boss agent" below).
 chat-team-boss
@@ -156,6 +157,90 @@ Key isolation points:
 **Team profile injection.** `~/.chat_team/team.md` is read once by `load_settings` into `settings.team_profile` (stripped); when non-empty, `Agent._build_system_messages` splices it as a `[团队信息]` block alongside the role prompt and meta lines. Empty/missing file → no block, behaviour unchanged. The compactor's `_summarize` uses its own sterile system prompt (`compactor.py:100-107`) and is intentionally NOT touched. Hot-reloadable: `chat-team --reload` (or `kill -HUP <pid>`) re-reads `team.md` into `settings.team_profile` in place; the next turn's system-prompt rebuild picks it up without a restart. See "Hot reload" below.
 
 **LLM debug log.** Opt-in: set `llm.debug_log_enabled: true` in `~/.chat_team/config.yaml` (default off — one file per call piles up fast and transcripts can carry sensitive user content, so production must stay off). When on, every call into `OpenAIChatCompletionProvider.complete` writes a JSON file to `<workspace>/.chat_team/llm/<ts>-<seq>-<role>-<kind>.json`. The record carries the full request payload (messages + tools + model + temperature + max_tokens), the response (content + tool_calls + finish_reason + usage from `completion.usage.model_dump()`), and `latency_ms`. Three `call_kind` values: `agent` (main turn), `compactor` (post-turn summary), `vision` (eager OCR shim + `describe_image` tool). Failures write the same file with `error=repr(exc)` and `response=null` before re-raising. **Base64 image data URIs are redacted** to `[redacted: <mime> <bytes> bytes]` via `chat_team.llm.debug_logger.redact_messages` — files stay grep-able. Per-session monotonic `seq` (process-local dict keyed by `session_id`) keeps filenames sortable when the millisecond clock collides. The provider's `_maybe_write_log` reuses the exact `messages_payload` it built for OpenAI (no re-serialisation), so what you see in the log is what the API saw. Writes are best-effort: a write failure is logged at WARNING and the call still returns normally.
+
+## Slash commands (chat-side, 企业微信端)
+
+Four user-facing slash commands live entirely in
+`WeComBotAdapter._handle_msg_callback` — intercepted **after** the
+`private_chat` gate but **before** `_enqueue_inbound_turn`, so they bypass
+the per-session inbound queue entirely. A slash command never creates a
+`Session`, never enters the dispatcher, and never makes an LLM call: it
+replies with one `aibot_respond_msg` stream frame (via
+`WeComStreamHandle.finish`) and returns.
+
+| Command | Scope | Behaviour |
+|---|---|---|
+| `/new` | group + private | Clear every role's conversation history for this session, **preserve `current_role` and all workspace files** (`inbox/`, `.chat_team/runs/`, `.chat_team/llm/`, `notebook.md`). Refuses with "请先 /stop" if a turn is in flight — the user must explicitly stop a running task before resetting. |
+| `/stop` | group + private | Cancel the running inbound-worker task for this session (`asyncio.Task.cancel()`) **and** drain the per-session inbound queue (`drain_pending_turns`) so any turns queued behind the cancelled one don't immediately re-fire. Idle → "当前没有正在执行的任务". |
+| `/status` | group + private | "🟢 正在执行任务（角色: X）" or "⚪ 当前空闲。" Reads `Dispatcher._busy_sessions` — never touches `session.lock`. |
+| `/running` | **private only** | Enumerate `Dispatcher.busy_group_sessions()` (filters by the `wecom-group-` session-id prefix) and reply with the count + the chatid list. Sent in a group → refused with "/running 仅在私聊中可用". |
+
+### Trigger rules
+
+- **Group chats** require an `@bot` mention before the command
+  (`@bot /new`), matching the existing group-@bot contract for normal
+  conversation. A bare `/new` in a group is treated as ordinary user text
+  and forwarded to the agent. This prevents a member typing "/new"
+  mid-sentence from resetting the session.
+- **Private chats** need no `@bot` (the `private_chat` gate already
+  controls who can reach the slash layer; default-deny whitelist means a
+  brand-new install answers no slash commands from private chats either
+  until the maintainer opens the gate).
+- Word-boundary anchored: `/newton` does **not** match `/new`. Case-
+  insensitive. Only `msgtype == "text"` is considered — images/mixed/
+  voice can never be slash commands.
+
+### Why `/stop` is safe (history rollback)
+
+`asyncio.CancelledError` is `BaseException`, not `Exception`. The agent's
+tool loop has `try: ... except TransferRequested: raise; except BaseException:
+del self.history[pre_turn_len:]; raise` — so a `/stop` mid-LLM-call or
+mid-tool-loop rolls back everything the agent appended this turn (the
+pending user message, any half-finished `assistant(tool_calls)`, any
+unanswered tool results). Without this, the next turn would either replay
+a dangling user message or 400 the OpenAI request with an
+`assistant(tool_calls)` whose tool replies never landed. The dispatcher's
+own `_handle_locked` `finally` resets turn counters; the outer `handle`
+`finally` clears the busy-state entry — so `/status` immediately after
+`/stop` reports idle.
+
+### Busy-state tracking (`Dispatcher._busy_sessions`)
+
+`Dispatcher.handle` sets `_busy_sessions[session_id] = current_role`
+**before** acquiring `session.lock` (so `/status` and `/running` see an
+accurate picture even when a turn is queued behind a previous turn waiting
+on the lock) and clears it in a `finally` that runs even on
+`CancelledError`. `is_busy` / `current_role_for` / `busy_group_sessions`
+are pure dict reads — they never take `session.lock`, so they can't
+deadlock against a long-running turn.
+
+### `reset_session_history` semantics
+
+Clears `session.agents_by_role` (forces `_agent_for` to re-materialise on
+the next turn from the now-empty `restored_histories`), clears
+`session.restored_histories`, then writes `session.json` atomically via
+`persistence.write_atomic` with `histories == {}` and the **same**
+`current_role`. Any pending debounced flush is cancelled first so it
+can't clobber the reset with a stale snapshot. Does NOT touch
+`notebook.md` — the team whiteboard persists across `/new` (it's a shared
+cross-role fact store, not conversation history).
+
+### Adapter ↔ Dispatcher coupling
+
+The adapter reaches the dispatcher via `self._handler.__self__` (the bound
+method's instance) — `_dispatcher_ref()` duck-types for the four command
+methods and returns `None` if the handler is a test fake. Slash commands
+degrade to "命令不可用（未连接调度器）" when no dispatcher is wired, so
+existing test fakes that register a plain coroutine keep working unchanged.
+
+**Key files:** `adapters/wecom.py` (`_match_slash_command`,
+`_handle_slash_command`, `drain_pending_turns`, `_cancel_running_turn`,
+`_reply_slash`, `_dispatcher_ref`, the `_SLASH_CMD_RE` interception block
+in `_handle_msg_callback`), `dispatcher.py` (`_busy_sessions`,
+`is_busy`, `current_role_for`, `busy_group_sessions`,
+`reset_session_history`, the `handle`→`_handle_locked` split for busy-state
+cleanup), `agent/agent.py` (`except BaseException` rollback),
+`scripts/smoke_slash_commands.py` (8-case coverage).
 
 ## Hot reload (`chat-team --reload` / SIGHUP)
 
