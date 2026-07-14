@@ -126,6 +126,10 @@ class Dispatcher:
                 log.exception(
                     "stream.finish failed for session=%s", session.session_id,
                 )
+            log.info(
+                "turn completed for session=%s role=%s",
+                session.session_id, session.current_role,
+            )
             try:
                 await self._post_turn(session)
             except Exception:                                  # noqa: BLE001
