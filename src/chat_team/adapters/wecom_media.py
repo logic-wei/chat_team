@@ -62,7 +62,7 @@ HttpGet = Callable[[str], Awaitable[bytes]]
 # a different node succeeds. So we split the timeout budget by phase and
 # give the connection phases a TIGHT ceiling while leaving body transfer
 # generous headroom. Worst case below stays well inside the 300s URL
-# lifetime: 20s × 6 attempts = 120s, plus the rare full-20s handover.
+# lifetime: 20s × 10 attempts = 200s, plus the rare full-20s handover.
 #
 # Phase split (per attempt):
 #   - connect        = 5s   # whole connection setup incl. DNS + TCP + TLS
@@ -77,7 +77,7 @@ _DOWNLOAD_CONNECT_TIMEOUT_SECONDS = 5
 _DOWNLOAD_SOCK_CONNECT_TIMEOUT_SECONDS = 5
 _DOWNLOAD_SOCK_READ_TIMEOUT_SECONDS = 15
 _DOWNLOAD_TOTAL_TIMEOUT_SECONDS = 20
-_DOWNLOAD_MAX_ATTEMPTS = 6   # = 1 initial + 5 retries
+_DOWNLOAD_MAX_ATTEMPTS = 10  # = 1 initial + 9 retries
 
 
 async def _http_get(url: str) -> bytes:
@@ -96,9 +96,9 @@ async def _http_get(url: str) -> bytes:
       - sock_read              = 15s  (body transfer — generous)
       - total                  = 20s  (hard per-attempt ceiling)
 
-    Retries: up to 5 immediate retries (6 attempts total), each on a fresh
+    Retries: up to 9 immediate retries (10 attempts total), each on a fresh
     ``ClientSession`` so connection-pool reuse can't pin us to a bad node.
-    All attempts combined (120s worst-case) stay well inside the ~5min URL lifetime.
+    All attempts combined (200s worst-case) stay well inside the ~5min URL lifetime.
     """
     timeout = aiohttp.ClientTimeout(
         total=_DOWNLOAD_TOTAL_TIMEOUT_SECONDS,
