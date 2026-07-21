@@ -39,6 +39,8 @@ python scripts/smoke_p0_round2.py                 # _bg_tasks strong-ref + concu
 python scripts/smoke_mcp.py                       # MCP proxy tool + config parsing + agent integration
 python scripts/smoke_solo.py                      # solo mode: per-bot dispatchers + shared notebook + isolated persistence
 python scripts/smoke_private_chat_policy.py     # private_chat policy: open/closed/blacklist/whitelist + adapter gate + enter_chat
+python scripts/smoke_key_rotation.py            # llm.api_keys round-robin: (session,role) binding + idle reset + multi-key retry + single-key compat
+python scripts/smoke_slash_commands.py            # /new /stop /status (group+private) + /running (private-only) + history rollback on /stop
 
 # Conversational team-setup CLI (not the WeCom bot — see "Boss agent" below).
 chat-team-boss
@@ -132,6 +134,12 @@ Key isolation points:
 
 **Split vision / chat providers.** 视觉/OCR 调用可以走独立的 API 端点。凭证在 `config.yaml` 的 `llm.vision.api_key` / `llm.vision.base_url` 配置，留空则回落至 `llm.api_key` / `llm.base_url`；也可通过 `OPENAI_VISION_API_KEY` / `OPENAI_VISION_BASE_URL` 环境变量设置（config.yaml 优先）。`llm.vision.model` 指定视觉模型名称（留空则复用 `llm.chat.model`）。当凭证与主模型相同时复用同一 `LLMProvider` 实例（不多开连接）。`app.build_vision_llm_provider` 处理此逻辑；`Dispatcher` 持有 `self._vision_llm` 并传给急切 OCR shim（`apply_vision_strategy`）和 `Agent` 构造（`describe_image` 工具经 `ToolContext.vision_llm` 使用）。Compactor 始终用聊天模型。
 
+**Multi-API-key rotation (prefix-cache friendly).** `llm.api_keys: [sk-a, sk-b, ...]` (and `llm.vision.api_keys` for the vision provider) lets a single process rotate across N API keys. The unit of binding is `(session_id, role_name)` — *not* the workspace: different roles in the same session get **different** keys (their histories are isolated, so there's no shared prefix cache to lose). On the first request for a pair the round-robin pointer advances (`SessionKeyRouter`, `llm/key_rotation.py`) and that key is reused for every subsequent turn of the same pair so the upstream prefix cache stays warm. A binding is released after `llm.key_rotation.idle_reset_seconds` (default 600s, **10 min**) of no activity; the next request for that pair **continues the rotation** (advances the pointer — it does NOT re-pick the just-released key). Bindings are **in-memory only**: not persisted across restart, not hot-reloadable (`api_keys` / `key_rotation` are `requires_restart`, baked into constructed `AsyncOpenAI` clients at startup).
+
+  **Failure handling — try every key, never disable.** On a failed call the provider iterates the bound key first, then every other key in round-robin order, each retried up to `llm.max_retries` (default 3) times → up to N×3 attempts before the last exception bubbles. Retryable errors (`APITimeoutError` / `APIConnectionError` / `RateLimitError` / `InternalServerError`) are retried with backoff on the *same* key first; non-retryable errors (401/403/etc) jump to the next key immediately (no 3× hammer). **No key is ever permanently disabled** — a key that fails stays eligible for future bindings. The binding itself never moves on failure: even if the call succeeds on a *different* key, the next turn for that `(session, role)` reuses the original bound key (unless it has since gone idle). This matches the maintainer's rule: "once bound, always this key; only idle reset advances; failures never permanently disable."
+
+  **Vision shares the router.** When vision credentials are identical to the main provider's, `build_vision_llm_provider` returns `main_llm` itself — sharing not just the httpx connection pool but also the `SessionKeyRouter`, so eager OCR / `describe_image` calls reuse the same key the chat turns are using. Separate vision keys (`llm.vision.api_keys`) get their own router. All call paths already pass `session_id` + `role_name` on `CompletionRequest`, so the agent/compactor/vision-shim/describe-image all route through the same binding with zero call-site changes. Single-key installs (no `api_keys`, just `api_key`) get one client and `router=None` — identical behaviour to before, full backward compat.
+
 **Image description cache.** `chat_team.llm.image_description_cache.ImageDescriptionCache` is a process-level LRU keyed by `(abs_path, mtime_ns, size, detail, model, prompt)` → description text. Caps: `MAX_ENTRIES=128`, `MAX_TOTAL_BYTES≈1MB`. Module-level singleton via `default_cache()`; same image with same prompt+detail+model is OCR'd exactly once across roles, sessions, and turns within a process. Different prompt or different file mtime/size invalidates. The cache is shared by both the eager shim AND the `describe_image` tool, so an agent re-querying with a custom prompt only pays for prompts not already cached.
 
 **Image base64 cache.** `chat_team.llm.image_cache.ImageDataURICache` is a module-level LRU keyed by `(abs_path, mtime_ns, size, resize_long_side, resize_quality)` → `data:image/<mime>;base64,...`. Caps: `MAX_ENTRIES=32`, `MAX_TOTAL_BYTES≈32MB`. Per-image `max_inline_bytes` defaults to 6MB (raw — base64 ≈ 8MB, leaves headroom under OpenAI's ~10MB request limit); configurable via `config.yaml` `llm.vision.max_inline_bytes`. Missing file → `None`. Oversize behaviour depends on `llm.vision.oversized_image`: `"resize"` (default) auto-downscales the image so the longest dimension ≤ `resize_long_side` pixels (default 2048) and re-encodes as JPEG at `resize_quality` (default 85), then serves the resized data URI; `"reject"` returns `None` (text placeholder). Pillow is required for resize; without it, oversized images degrade to placeholders with a WARNING. RGBA images are composited onto white before JPEG re-encoding. The provider degrades missing/unrecoverable files to `[图:<name>(已丢失)]` / `(过大,已省略)` text blocks so a single bad image doesn't fail the whole turn. MIME map reuses `wecom_media.sniff_extension` (jpg/png/gif/webp; everything else → image/jpeg). `configure_default_cache()` in `app.py` wires the cache singleton to settings at startup.
@@ -149,6 +157,90 @@ Key isolation points:
 **Team profile injection.** `~/.chat_team/team.md` is read once by `load_settings` into `settings.team_profile` (stripped); when non-empty, `Agent._build_system_messages` splices it as a `[团队信息]` block alongside the role prompt and meta lines. Empty/missing file → no block, behaviour unchanged. The compactor's `_summarize` uses its own sterile system prompt (`compactor.py:100-107`) and is intentionally NOT touched. Hot-reloadable: `chat-team --reload` (or `kill -HUP <pid>`) re-reads `team.md` into `settings.team_profile` in place; the next turn's system-prompt rebuild picks it up without a restart. See "Hot reload" below.
 
 **LLM debug log.** Opt-in: set `llm.debug_log_enabled: true` in `~/.chat_team/config.yaml` (default off — one file per call piles up fast and transcripts can carry sensitive user content, so production must stay off). When on, every call into `OpenAIChatCompletionProvider.complete` writes a JSON file to `<workspace>/.chat_team/llm/<ts>-<seq>-<role>-<kind>.json`. The record carries the full request payload (messages + tools + model + temperature + max_tokens), the response (content + tool_calls + finish_reason + usage from `completion.usage.model_dump()`), and `latency_ms`. Three `call_kind` values: `agent` (main turn), `compactor` (post-turn summary), `vision` (eager OCR shim + `describe_image` tool). Failures write the same file with `error=repr(exc)` and `response=null` before re-raising. **Base64 image data URIs are redacted** to `[redacted: <mime> <bytes> bytes]` via `chat_team.llm.debug_logger.redact_messages` — files stay grep-able. Per-session monotonic `seq` (process-local dict keyed by `session_id`) keeps filenames sortable when the millisecond clock collides. The provider's `_maybe_write_log` reuses the exact `messages_payload` it built for OpenAI (no re-serialisation), so what you see in the log is what the API saw. Writes are best-effort: a write failure is logged at WARNING and the call still returns normally.
+
+## Slash commands (chat-side, 企业微信端)
+
+Four user-facing slash commands live entirely in
+`WeComBotAdapter._handle_msg_callback` — intercepted **after** the
+`private_chat` gate but **before** `_enqueue_inbound_turn`, so they bypass
+the per-session inbound queue entirely. A slash command never creates a
+`Session`, never enters the dispatcher, and never makes an LLM call: it
+replies with one `aibot_respond_msg` stream frame (via
+`WeComStreamHandle.finish`) and returns.
+
+| Command | Scope | Behaviour |
+|---|---|---|
+| `/new` | group + private | Clear every role's conversation history for this session, **preserve `current_role` and all workspace files** (`inbox/`, `.chat_team/runs/`, `.chat_team/llm/`, `notebook.md`). Refuses with "请先 /stop" if a turn is in flight — the user must explicitly stop a running task before resetting. |
+| `/stop` | group + private | Cancel the running inbound-worker task for this session (`asyncio.Task.cancel()`) **and** drain the per-session inbound queue (`drain_pending_turns`) so any turns queued behind the cancelled one don't immediately re-fire. Idle → "当前没有正在执行的任务". |
+| `/status` | group + private | "🟢 正在执行任务（角色: X）" or "⚪ 当前空闲。" Reads `Dispatcher._busy_sessions` — never touches `session.lock`. |
+| `/running` | **private only** | Enumerate `Dispatcher.busy_group_sessions()` (filters by the `wecom-group-` session-id prefix) and reply with the count + the chatid list. Sent in a group → refused with "/running 仅在私聊中可用". |
+
+### Trigger rules
+
+- **Group chats** require an `@bot` mention before the command
+  (`@bot /new`), matching the existing group-@bot contract for normal
+  conversation. A bare `/new` in a group is treated as ordinary user text
+  and forwarded to the agent. This prevents a member typing "/new"
+  mid-sentence from resetting the session.
+- **Private chats** need no `@bot` (the `private_chat` gate already
+  controls who can reach the slash layer; default-deny whitelist means a
+  brand-new install answers no slash commands from private chats either
+  until the maintainer opens the gate).
+- Word-boundary anchored: `/newton` does **not** match `/new`. Case-
+  insensitive. Only `msgtype == "text"` is considered — images/mixed/
+  voice can never be slash commands.
+
+### Why `/stop` is safe (history rollback)
+
+`asyncio.CancelledError` is `BaseException`, not `Exception`. The agent's
+tool loop has `try: ... except TransferRequested: raise; except BaseException:
+del self.history[pre_turn_len:]; raise` — so a `/stop` mid-LLM-call or
+mid-tool-loop rolls back everything the agent appended this turn (the
+pending user message, any half-finished `assistant(tool_calls)`, any
+unanswered tool results). Without this, the next turn would either replay
+a dangling user message or 400 the OpenAI request with an
+`assistant(tool_calls)` whose tool replies never landed. The dispatcher's
+own `_handle_locked` `finally` resets turn counters; the outer `handle`
+`finally` clears the busy-state entry — so `/status` immediately after
+`/stop` reports idle.
+
+### Busy-state tracking (`Dispatcher._busy_sessions`)
+
+`Dispatcher.handle` sets `_busy_sessions[session_id] = current_role`
+**before** acquiring `session.lock` (so `/status` and `/running` see an
+accurate picture even when a turn is queued behind a previous turn waiting
+on the lock) and clears it in a `finally` that runs even on
+`CancelledError`. `is_busy` / `current_role_for` / `busy_group_sessions`
+are pure dict reads — they never take `session.lock`, so they can't
+deadlock against a long-running turn.
+
+### `reset_session_history` semantics
+
+Clears `session.agents_by_role` (forces `_agent_for` to re-materialise on
+the next turn from the now-empty `restored_histories`), clears
+`session.restored_histories`, then writes `session.json` atomically via
+`persistence.write_atomic` with `histories == {}` and the **same**
+`current_role`. Any pending debounced flush is cancelled first so it
+can't clobber the reset with a stale snapshot. Does NOT touch
+`notebook.md` — the team whiteboard persists across `/new` (it's a shared
+cross-role fact store, not conversation history).
+
+### Adapter ↔ Dispatcher coupling
+
+The adapter reaches the dispatcher via `self._handler.__self__` (the bound
+method's instance) — `_dispatcher_ref()` duck-types for the four command
+methods and returns `None` if the handler is a test fake. Slash commands
+degrade to "命令不可用（未连接调度器）" when no dispatcher is wired, so
+existing test fakes that register a plain coroutine keep working unchanged.
+
+**Key files:** `adapters/wecom.py` (`_match_slash_command`,
+`_handle_slash_command`, `drain_pending_turns`, `_cancel_running_turn`,
+`_reply_slash`, `_dispatcher_ref`, the `_SLASH_CMD_RE` interception block
+in `_handle_msg_callback`), `dispatcher.py` (`_busy_sessions`,
+`is_busy`, `current_role_for`, `busy_group_sessions`,
+`reset_session_history`, the `handle`→`_handle_locked` split for busy-state
+cleanup), `agent/agent.py` (`except BaseException` rollback),
+`scripts/smoke_slash_commands.py` (8-case coverage).
 
 ## Hot reload (`chat-team --reload` / SIGHUP)
 
@@ -190,10 +282,10 @@ these are bound to live OS resources that can't be swapped mid-flight):
 
 - `mode` (team↔solo), `bots[].{bot_id,secret}` (open WebSocket connections),
   `workspace_root`, `mcp.servers` (subprocess/SSE lifecycle).
-- `llm.{api_key,base_url,request_timeout_seconds,http_debug_log_enabled}` —
+- `llm.{api_key,api_keys,base_url,key_rotation,request_timeout_seconds,http_debug_log_enabled}` —
   baked into the constructed `AsyncOpenAI` + `httpx` client at startup; swap
   them by editing `config.yaml` then `--stop && chat-team`.
-- `llm.vision.{api_key,base_url}` — same (vision provider is constructed once).
+- `llm.vision.{api_key,api_keys,base_url}` — same (vision provider is constructed once).
 
 **Trigger options.** `chat-team --reload` reads the pid file and sends SIGHUP.
 `kill -HUP <pid>` works directly. The SIGHUP handler is **non-cancelling**:

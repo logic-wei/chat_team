@@ -248,10 +248,16 @@ class Agent:
             return "(已达到工具循环上限,本轮未给出最终答复)"
         except TransferRequested:
             raise
-        except Exception:
-            # LLM call timed out / 5xx'd / network died. Drop everything we
-            # appended this turn so the next turn (or the next time this
-            # role is reopened) doesn't see a malformed transcript.
+        except BaseException:
+            # LLM call timed out / 5xx'd / network died, OR the turn was
+            # cancelled via slash /stop (CancelledError is BaseException, not
+            # Exception, so the original `except Exception` missed it). Drop
+            # everything we appended this turn so the next turn (or the next
+            # time this role is reopened) doesn't see a malformed transcript
+            # — a half-appended user message, or worse, an assistant(tool_calls)
+            # whose tool replies never landed (which would 400 the next OpenAI
+            # request). We re-raise so CancelledError keeps propagating up to
+            # the dispatcher's busy-state cleanup in its finally block.
             del self.history[pre_turn_len:]
             raise
 

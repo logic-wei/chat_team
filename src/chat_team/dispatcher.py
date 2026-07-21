@@ -49,12 +49,37 @@ class Dispatcher:
         self._vision_llm = vision_llm
         # Solo mode: pin to a single role, skip transfer loop.
         self._fixed_role = fixed_role
+        # Tracks which sessions currently have a turn in flight, mapped to the
+        # current_role name at the time the turn started. Used by slash
+        # commands (/status, /running, /stop, /new) which need to inspect or
+        # control running turns without entering the session lock. Read/written
+        # only from the event loop thread (asyncio single-threaded), so no
+        # extra locking needed.
+        self._busy_sessions: dict[str, str] = {}
 
     async def handle(self, msg: IncomingMessage, stream: StreamHandle) -> None:
         session = await self.sessions.get_or_create(msg.session_id)
         # Prefer rich content_blocks (multi-modal); fall back to flat text for
         # adapters that haven't been upgraded.
         user_content = msg.content_blocks if msg.content_blocks else msg.text
+        # Mark this session as busy BEFORE acquiring the lock so /status and
+        # /running (which never take the lock) see an accurate picture even
+        # while the turn is waiting on session.lock behind a previous turn.
+        self._busy_sessions[session.session_id] = session.current_role
+        try:
+            await self._handle_locked(session, user_content, stream)
+        finally:
+            # Clear busy state even if the turn was cancelled via /stop
+            # (CancelledError is BaseException, propagates through the lock
+            # __aexit__; this finally still runs).
+            self._busy_sessions.pop(session.session_id, None)
+
+    async def _handle_locked(
+        self,
+        session: Session,
+        user_content,
+        stream: StreamHandle,
+    ) -> None:
         async with session.lock:
             # On any failure inside _run_turn, agent.history may have been
             # mutated (user message appended, tool loop partially run). We
@@ -101,6 +126,10 @@ class Dispatcher:
                 log.exception(
                     "stream.finish failed for session=%s", session.session_id,
                 )
+            log.info(
+                "turn completed for session=%s role=%s",
+                session.session_id, session.current_role,
+            )
             try:
                 await self._post_turn(session)
             except Exception:                                  # noqa: BLE001
@@ -137,6 +166,74 @@ class Dispatcher:
                 log.exception("compaction failed for role=%s", agent.role.name)
         if self.persistence is not None:
             self.persistence.schedule(session)
+
+    # ---- slash-command support surface -----------------------------------
+    # These methods are called by the adapter's slash-command handler. They
+    # are designed to be called WITHOUT holding session.lock — they either
+    # read lock-free state (busy tracking) or operate on the session metadata
+    # files directly. /new refuses if a turn is in flight (caller checks
+    # is_busy first); /stop cancels the running task from the adapter side
+    # (the adapter owns the inbound worker task) and these methods only
+    # provide the read-side introspection.
+
+    def is_busy(self, session_id: str) -> bool:
+        """True if a turn is currently in flight for this session."""
+        return session_id in self._busy_sessions
+
+    def current_role_for(self, session_id: str) -> str | None:
+        """The role name of the in-flight turn, or None if idle. Useful for
+        /status replies so the user knows which employee is working."""
+        return self._busy_sessions.get(session_id)
+
+    def busy_group_sessions(self) -> list[str]:
+        """Session IDs of group chats with an in-flight turn. Used by the
+        private-chat /running command. Filters by the WeCom group session_id
+        prefix; adapters using a different prefix scheme should override."""
+        return [
+            sid for sid in self._busy_sessions
+            if sid.startswith("wecom-group-")
+        ]
+
+    async def reset_session_history(self, session_id: str) -> str:
+        """Clear all per-role conversation histories for a session, leaving
+        workspace files (inbox/, .chat_team/runs/, .chat_team/llm/,
+        notebook.md) untouched. Preserves current_role. Returns the
+        current_role so the caller can echo it in the reply.
+
+        MUST be called only when is_busy(session_id) is False — clearing
+        histories while a turn is running would race the agent's history
+        mutations. The adapter's slash handler checks is_busy() first and
+        refuses /new if busy.
+
+        We do NOT acquire session.lock here: if the session is idle the lock
+        is uncontended, and the only in-memory state we mutate is
+        agents_by_role (clearing it forces _agent_for to rebuild on next
+        turn) plus the on-disk session.json (rewritten atomically)."""
+        session = await self.sessions.get_or_create(session_id)
+        # Drop in-memory agents so the next turn re-materialises them from
+        # the (now empty) restored_histories. Without this, a stale Agent
+        # holding its old history would survive the reset.
+        session.agents_by_role.clear()
+        session.restored_histories.clear()
+        # Rewrite session.json with empty histories but the same current_role.
+        # Go through persistence.flush_now so the atomic-write + schema stays
+        # in one place; if persistence is unwired, fall back to write_atomic
+        # directly (the snapshot of a cleared agents_by_role is empty
+        # histories, which is exactly what we want).
+        from .session.persistence import snapshot, write_atomic
+        snap = snapshot(session)  # histories == {} after agents_by_role.clear()
+        write_atomic(session.cwd, snap, session.state_filename)
+        # Cancel any pending debounced flush so it doesn't clobber our reset
+        # with a stale snapshot taken before the clear.
+        if self.persistence is not None:
+            old = self.persistence._pending.pop(session_id, None)
+            if old is not None and not old.done():
+                old.cancel()
+        log.info(
+            "session %s history reset (slash /new); current_role=%s preserved",
+            session_id, session.current_role,
+        )
+        return session.current_role
 
     async def _run_turn(
         self,

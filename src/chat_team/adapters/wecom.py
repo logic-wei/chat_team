@@ -68,6 +68,15 @@ MEDIA_SIZE_LIMITS = {
 
 _MENTION_RE = re.compile(r"^@\S+\s+")
 
+# Slash command matching. Anchored at start, requires a word boundary after
+# the command name so "/newton" does NOT match "/new". Case-insensitive.
+# Group 1 captures the bare command name (lower-cased by the caller).
+_SLASH_CMD_RE = re.compile(r"^/(new|stop|status|running)\b", re.IGNORECASE)
+# Commands that operate on the current session (group OR private).
+_SESSION_SLASH_CMDS = {"new", "stop", "status"}
+# /running is private-chat only (it inspects OTHER sessions' busy state).
+_PRIVATE_ONLY_SLASH_CMDS = {"running"}
+
 
 def _strip_mention_from_first_text(blocks: list[ContentBlock]) -> list[ContentBlock]:
     """Remove a leading ``@bot `` mention from the first text block.
@@ -635,6 +644,29 @@ class WeComBotAdapter(BotAdapter):
                         order_consumed = True
                     return
 
+            # ---- slash command interception -------------------------------
+            # Done here (after the private_chat gate, before media resolution
+            # and inbound queueing) so /stop is NOT serialised behind the very
+            # turn it is supposed to cancel. Slash commands bypass the inbound
+            # queue entirely: they reply with a single aibot_respond_msg stream
+            # frame and never create a Session or enter the dispatcher.
+            msgtype_early = body.get("msgtype") or "text"
+            slash_cmd = self._match_slash_command(inbound, msgtype_early)
+            if slash_cmd is not None:
+                # /running is private-chat only; in a group it degrades to a
+                # polite refusal rather than executing.
+                if slash_cmd in _PRIVATE_ONLY_SLASH_CMDS and inbound.chat_type != ChatType.SINGLE:
+                    await self._reply_slash(
+                        inbound.reply_token,
+                        "/running 仅在私聊中可用。请在 1:1 对话中发送。",
+                    )
+                else:
+                    await self._handle_slash_command(slash_cmd, inbound)
+                await self._skip_inbound_order(order_key)
+                order_consumed = True
+                return
+            # ---- end slash interception -----------------------------------
+
             msgtype = body.get("msgtype") or "text"
             if order_key is None:
                 log.error("unable to assign inbound order; dropping msgid=%s", msg_id)
@@ -1013,6 +1045,222 @@ class WeComBotAdapter(BotAdapter):
         if from_user:
             return f"wecom-single-{aibot_id}-{from_user}"
         return None
+
+    # ---- slash command machinery -----------------------------------------
+
+    def _dispatcher_ref(self) -> Any:
+        """Return the Dispatcher instance backing this adapter's handler, or
+        None if the handler isn\'t a bound method of a Dispatcher (e.g. a
+        test fake). We resolve this lazily rather than wiring an explicit
+        Dispatcher reference at construction time so the adapter stays
+        decoupled from the dispatcher module (no circular import) and so
+        existing test fakes that register a plain coroutine keep working.
+        The slash commands simply degrade to "command unavailable" when
+        this returns None."""
+        h = self._handler
+        if h is None:
+            return None
+        disp = getattr(h, "__self__", None)
+        if disp is None:
+            return None
+        # Duck-type: the methods we need.
+        if all(hasattr(disp, m) for m in ("is_busy", "busy_group_sessions", "reset_session_history", "current_role_for")):
+            return disp
+        return None
+
+    def _match_slash_command(
+        self,
+        inbound: IncomingMessage,
+        msgtype: str,
+    ) -> str | None:
+        """Return the lower-cased command name if this inbound text message
+        is a recognised slash command, else None.
+
+        Rules:
+          * Only ``msgtype == "text"`` is considered. Images/mixed/voice/etc
+            can\'t be commands.
+          * The command must be the first token of the message body
+            (anchored at start). A word boundary after the name is required
+            so "/newton" does not match "/new".
+          * In GROUP chats the message MUST mention the bot first
+            (``@bot /new``); a bare "/new" in a group is treated as ordinary
+            text and forwarded to the agent. This matches the existing
+            group-@bot contract for normal conversations and prevents a
+            member mentioning "/new" mid-sentence from resetting the session.
+          * In SINGLE (private) chats no @bot is required — the
+            private_chat gate already controls who can reach this point.
+          * Case-insensitive.
+        """
+        if msgtype != "text":
+            return None
+        # Raw text content of the body, before block resolution. We don\'t
+        # need full _resolve_inbound_blocks for a plain text message — the
+        # content is right there in body.text.content. Quote handling is
+        # irrelevant: a slash command would never be sent as a quote reply.
+        body = inbound.raw or {}
+        content = ((body.get("text") or {}).get("content") or "").strip()
+        if not content:
+            return None
+
+        text = content
+        if inbound.chat_type == ChatType.GROUP:
+            # Strip a leading "@<botname> " mention. We reuse the same regex
+            # as _strip_mention_from_first_text so the matching semantics stay
+            # identical to normal group-message handling.
+            stripped = _MENTION_RE.sub("", text, count=1).strip()
+            if stripped == text:
+                # No @bot prefix in a group → not a command invocation.
+                return None
+            text = stripped
+
+        m = _SLASH_CMD_RE.match(text)
+        if m is None:
+            return None
+        return m.group(1).lower()
+
+    async def _reply_slash(self, req_id: Any, text: str) -> None:
+        """Reply to a slash command with a single finished stream frame.
+        Reuses the same WeComStreamHandle path as _reply_blocked — the only
+        frame format WeCom honours for ordinary message callbacks is
+        msgtype=stream with finish=true."""
+        stream = WeComStreamHandle(self, req_id=req_id)
+        await stream.finish(text)
+
+    def drain_pending_turns(self, session_id: str) -> int:
+        """Mark all queued-but-not-yet-dispatched inbound turns for this
+        session as dropped, so /stop doesn\'t leave the next queued message
+        immediately re-triggering the agent. Returns the count of turns
+        drained.
+
+        The currently-running turn (if any) is NOT touched here — it\'s
+        cancelled separately via _cancel_running_turn. This method only
+        handles turns sitting in the queue behind the running one."""
+        q = self._inbound_queues.get(session_id)
+        if q is None:
+            return 0
+        drained = 0
+        for turn in q.turns.values():
+            if not turn.drop:
+                turn.drop = True
+                # Mark ready so the worker\'s wait_for(turn.ready.wait())
+                # doesn\'t block on a drained turn that will never resolve
+                # media. drop=True short-circuits dispatch anyway.
+                if not turn.ready.is_set():
+                    turn.ready.set()
+                drained += 1
+        return drained
+
+    async def _cancel_running_turn(self, session_id: str) -> bool:
+        """Cancel the inbound worker task currently running a turn for this
+        session, if any. Returns True if a task was actually cancelled.
+
+        The running turn lives inside ``_inbound_queues[session_id].worker``
+        — that worker task is the one ``await``\'ing
+        ``handler(...)`` (i.e. ``dispatcher.handle``). Cancelling it raises
+        CancelledError inside dispatcher.handle, which propagates out of the
+        ``async with session.lock`` block; the dispatcher\'s
+        ``_handle_locked`` finally resets turn counters and the outer
+        ``handle`` finally clears the busy state. The agent\'s own
+        ``except BaseException`` then rolls back its half-appended history
+        so the next turn starts clean."""
+        q = self._inbound_queues.get(session_id)
+        if q is None or q.worker is None:
+            return False
+        task = q.worker
+        if task.done():
+            return False
+        # Drain queued turns FIRST so they don\'t immediately re-run when
+        # the worker task ends and a new worker is spawned for the next
+        # inbound message.
+        self.drain_pending_turns(session_id)
+        task.cancel()
+        # Don\'t await the task here — we\'re inside a different callback
+        # and we want to return the slash reply promptly. The cancelled
+        # task will resolve on its own; its finally-clause cleans up
+        # q.worker = None.
+        return True
+
+    async def _handle_slash_command(
+        self,
+        cmd: str,
+        inbound: IncomingMessage,
+    ) -> None:
+        """Dispatch a recognised slash command. ``inbound.chat_type`` has
+        already been validated (private-only commands filtered upstream)."""
+        sid = inbound.session_id
+        req_id = inbound.reply_token
+        disp = self._dispatcher_ref()
+
+        if cmd == "new":
+            if disp is None:
+                await self._reply_slash(req_id, "⚠️ 命令不可用（未连接调度器）。")
+                return
+            if disp.is_busy(sid):
+                await self._reply_slash(
+                    req_id,
+                    "⚠️ 会话正在执行任务中，请先发送 /stop 中止后再 /new。",
+                )
+                return
+            try:
+                role = await disp.reset_session_history(sid)
+            except Exception:                          # noqa: BLE001
+                log.exception("/new failed for session=%s", sid)
+                await self._reply_slash(req_id, "⚠️ 重置失败，请稍后重试。")
+                return
+            await self._reply_slash(
+                req_id,
+                f"✅ 会话已重置（保留工作区文件）。当前角色: {role}",
+            )
+            return
+
+        if cmd == "stop":
+            if disp is None:
+                await self._reply_slash(req_id, "⚠️ 命令不可用（未连接调度器）。")
+                return
+            cancelled = await self._cancel_running_turn(sid)
+            if cancelled:
+                await self._reply_slash(req_id, "⏹ 已中止当前任务。")
+            else:
+                # Still drain any pending queued turns for tidiness.
+                drained = self.drain_pending_turns(sid)
+                if drained:
+                    await self._reply_slash(
+                        req_id,
+                        f"⏹ 当前无运行中任务，已清空 {drained} 条排队消息。",
+                    )
+                else:
+                    await self._reply_slash(req_id, "⚪ 当前没有正在执行的任务。")
+            return
+
+        if cmd == "status":
+            if disp is None:
+                await self._reply_slash(req_id, "⚠️ 命令不可用（未连接调度器）。")
+                return
+            if disp.is_busy(sid):
+                role = disp.current_role_for(sid) or "?"
+                await self._reply_slash(req_id, f"🟢 正在执行任务（角色: {role}）")
+            else:
+                await self._reply_slash(req_id, "⚪ 当前空闲。")
+            return
+
+        if cmd == "running":
+            if disp is None:
+                await self._reply_slash(req_id, "⚠️ 命令不可用（未连接调度器）。")
+                return
+            busy = disp.busy_group_sessions()
+            if not busy:
+                await self._reply_slash(req_id, "⚪ 当前没有群会话正在执行任务。")
+                return
+            lines = [f"🟢 当前有 {len(busy)} 个群会话正在执行任务："]
+            for sid_i in busy:
+                # Strip the "wecom-group-" prefix for readability.
+                lines.append(f"  • {sid_i}")
+            await self._reply_slash(req_id, "\n".join(lines))
+            return
+
+        # Should not reach here — _match_slash_command only returns the four
+        # known names — but degrade gracefully.
+        await self._reply_slash(req_id, f"⚠️ 未知命令: /{cmd}")
 
     async def _reply_welcome(
         self,
